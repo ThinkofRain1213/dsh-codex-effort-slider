@@ -223,7 +223,8 @@ section("2b. 顶头适配：旋钮与滑条同高，且两端都不越界");
 
 section("2c. 贴最左时左端不露出直边（圆角不随宽度退化）");
 {
-  const { internals, react, host } = await setup();
+  const ctx = await setup();
+  const { internals, react, host } = ctx;
   const R = internals.KNOB_RADIUS;
   const H = internals.TRACK_HEIGHT;
 
@@ -280,9 +281,11 @@ section("2c. 贴最左时左端不露出直边（圆角不随宽度退化）");
   }
 
   // 右端直角为什么安全：填充右边界恒等于旋钮圆心，旋钮再向右多盖一个半径
-  const node = track(react, 0, TRACK_W);
-  node.fire("onPointerDown", { clientX: 0, pointerId: 1 });
-  node.fire("onPointerUp", {});
+  // ⚠️ 位置现在由**连续运动引擎**驱动（渲染时不再瞬移），所以必须泵帧让它跑到位。
+  track(react, 0, TRACK_W).fire("onPointerDown", { clientX: 0, pointerId: 1 });
+  await runFrames(ctx);
+  track(react, 0, TRACK_W).fire("onPointerUp", {});
+  await runFrames(ctx);
   await settle();
   eq(host.selects[host.selects.length - 1].reasoningEffort, "off", "[2c] 贴最左命中第一档");
   eq(internals.knobOffsetOf(0), `calc(${R}px + 0 * (100% - ${2 * R}px))`,
