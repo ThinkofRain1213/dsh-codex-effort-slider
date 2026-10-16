@@ -1,0 +1,16 @@
+# 统一行尾为 LF，避免「网页上传 = CRLF」造成的整文件假 diff（见 PR #11 讨论）
+* text=auto eol=lf
+
+*.js   text eol=lf
+*.mjs  text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.ps1  text eol=crlf
+*.cmd  text eol=crlf
+
+# 二进制（不要做行尾/编码转换）
+*.png  binary
+*.jpg  binary
+*.zip  binary
+*.tgz  binary

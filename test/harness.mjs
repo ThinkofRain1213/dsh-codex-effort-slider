@@ -422,6 +422,22 @@ export function createReactStub() {
       }
       if (key.startsWith("on") && typeof value === "function") { node.handlers[key] = value; continue; }
       if (key === "className") { node.className = value; node.setAttribute("class", value); continue; }
+      /**
+       * 布尔 DOM 属性必须**按 DOM 语义**挂到节点上（`node.disabled` / `node.checked` …），
+       * 而不是当成普通 attribute。
+       *
+       * ⚠️ 这条是踩出来的：`disabled={false}` 命中下面那条"false 就跳过"的分支，
+       *    于是 `node.disabled` 永远是 `undefined` ——
+       *    `eq(开关.disabled, false, "…仍可用")` 这类断言会**双双失败**
+       *    （期望 true 的也对不上），而真相是测试台根本没记录这个值。
+       *    真 DOM 里 `el.disabled = false` 是一个**存在的属性**，与"没设过"不同。
+       */
+      if (key === "disabled" || key === "checked" || key === "readOnly" || key === "selected") {
+        node[key] = value === true;
+        if (value === true) node.setAttribute(key, "");
+        else node.removeAttribute(key);
+        continue;
+      }
       if (value === undefined || value === null || value === false) continue;
       if (value === true) { node.setAttribute(key, ""); continue; }
       node.setAttribute(key, value);
@@ -637,6 +653,10 @@ export function createFakeHost(options = {}) {
 
   const registered = [];
   const subscriptions = [];
+  /** 设置卡片注册的 locale 词典（断言中英齐全用）。 */
+  const localeRegistrations = [];
+  /** effect 的标签（断言"设置词典确实登记过 cleanup"这类事实）。 */
+  const effectLabels = [];
   const ctx = {
     /** 监视宿主事件订阅：本插件应当**一次都不订阅**（这是"不注入消息"的结构性证据）。 */
     on: (name, ...rest) => {
@@ -661,6 +681,21 @@ export function createFakeHost(options = {}) {
         return { dispose() {} };
       },
     },
+    /**
+     * 官方 locale 服务的桩：设置卡片用 `ctx.locale.register(ns, {zh, en})` 注册自己的词典。
+     * 记录每次注册，测试可以断言"中英两套词条都齐"。
+     */
+    locale: {
+      register: (ns, dictionaries) => {
+        localeRegistrations.push({ ns, dictionaries });
+        return () => {};
+      },
+    },
+    /** effect 在桩里同步执行一次（真宿主按 fiber 生命周期管理）。 */
+    effect: (callback, label) => {
+      effectLabels.push(String(label));
+      try { return callback(); } catch (error) { return undefined; }
+    },
   };
 
   return {
@@ -671,6 +706,8 @@ export function createFakeHost(options = {}) {
     loads,
     registered,
     subscriptions,
+    localeRegistrations,
+    effectLabels,
     get directoryForCalls() { return directoryForCalls; },
   };
 }
@@ -701,15 +738,76 @@ export function loadBundle(bundlePath, document, options = {}) {
   MutationObserverStub.prototype.disconnect = function disconnect() { this.targets.length = 0; };
   MutationObserverStub.prototype.trigger = function trigger() { this.callback([]); };
 
-  const window = {
+  /**
+   * 假 window 上的事件表。
+   *
+   * ⚠️ 必须是真的可订阅 / 可派发：设置卡片与滑条都靠 `SETTINGS_EVENT` 广播来同步
+   *    （`writeSettings` 派发、两边监听），桩成空操作会让"设置变了有没有人收到"这件事
+   *    永远测不出来 —— 那正是最该被守住的一条。
+   */
+  const windowListeners = new Map();
+  /**
+   * 假 localStorage。
+   *
+   * ⚠️ 必须**真的有**：设置层靠它持久化，而"存不下要如实报 false"这条纪律
+   *    只有在一个会抛错的 localStorage 上才测得到（见 §27 的 failWrites 用例）。
+   *    `options.settings` 用于预置一份旧版 JSON（迁移的端到端测试）。
+   */
+  const storage = new Map();
+  if (options.settings !== undefined && options.settings !== null) {
+    storage.set("dsh-codex-effort-slider.settings", JSON.stringify(options.settings));
+  }
+  /** 让测试能模拟"磁盘满 / 配额超限"：把 `failWrites` 打开，setItem 就会抛。 */
+  const storageState = { failWrites: options.failWrites === true };
+  const localStorageStub = options.localStorage === null ? undefined : {
+    getItem: (key) => (storage.has(key) ? storage.get(key) : null),
+    setItem: (key, value) => {
+      if (storageState.failWrites) throw new Error("QuotaExceededError");
+      storage.set(key, String(value));
+    },
+    removeItem: (key) => { storage.delete(key); },
+    clear: () => { storage.clear(); },
+  };
+  /**
+   * `options.window` —— **复用一个已有的假 window**。
+   *
+   * ⚠️ 多实例守卫（`window.__cesActiveSliderOwner`）只有在**两个 bundle 共享同一个
+   *    window** 时才可测：真机上"插件被加载两次"本来就是两份模块落在一个页面上。
+   *    默认每次 loadBundle 给一套新 window，那样两份实例各看各的标记，永远都是 owner。
+   */
+  const shared = options.window;
+  /**
+   * `options.window` 复用一份已有假 window 时，**重新挂上注册捕获**：
+   * 那份 window 的 `__ModuleLoader__.load` 属于上一个 bundle（它的 `registration` 变量），
+   * 直接复用会让这里的 `registration` 永远为 null。
+   */
+  if (shared !== undefined && shared.__ModuleLoader__) {
+    shared.__ModuleLoader__.load = (reg) => { registration = reg; };
+  }
+  const window = shared !== undefined ? shared : {
     __ModuleLoader__: {
       load(reg) { registration = reg; },
     },
     innerWidth: 1280,
     innerHeight: 800,
-    addEventListener() {},
-    removeEventListener() {},
-    dispatchEvent() {},
+    addEventListener(type, listener) {
+      if (!windowListeners.has(type)) windowListeners.set(type, new Set());
+      windowListeners.get(type).add(listener);
+    },
+    removeEventListener(type, listener) {
+      const set = windowListeners.get(type);
+      if (set) set.delete(listener);
+    },
+    dispatchEvent(event) {
+      const type = event && event.type;
+      const set = type ? windowListeners.get(type) : undefined;
+      if (!set) return true;
+      for (const listener of [...set]) {
+        try { listener(event); } catch (error) { /* 单个订阅者抛错不传染 */ }
+      }
+      return true;
+    },
+    CustomEvent: function FakeCustomEvent(type) { this.type = type; },
     Event: function FakeEvent(type) { this.type = type; },
     MutationObserver: MutationObserverStub,
     setInterval: (fn, ms) => setInterval(fn, ms),
@@ -767,14 +865,91 @@ export function loadBundle(bundlePath, document, options = {}) {
   // 只给这个 bundle 传它真正依赖的宿主全局；其余走真实全局（Promise/Set/Math/Date…）。
   // performance 单独传**假时钟**：引擎的"指针速度/松手外推"都读它，必须可控。
   const performanceStub = { now: () => clockNow() };
-  const run = new Function("window", "document", "console", "setTimeout", "clearTimeout", "performance", code);
-  run(window, document, console, setTimeout, clearTimeout, performanceStub);
+  const run = new Function("window", "document", "console", "setTimeout", "clearTimeout", "performance", "localStorage", code);
+  run(window, document, console, setTimeout, clearTimeout, performanceStub, localStorageStub);
   if (registration === null) throw new Error("bundle 没有调用 window.__ModuleLoader__.load()");
   const react = createReactStub();
+  /**
+   * 官方 UI 原语的桩件。
+   *
+   * 真宿主里这些来自 `@deepseek-ai/dsh-client-ui-primitives`（Module Loader 形态的插件
+   * 隐式拿到它）。**不提供的话产品会走"原语不可用就跳过设置卡片"的降级分支** ——
+   * 那样卡片的断言会全部失去意义（假通过），所以这些桩件是必需的。
+   */
+  const primitives = {
+    Menu(props) {
+      const children = [props.anchor ?? null];
+      if (props.open === true) {
+        const items = Array.isArray(props.items) ? props.items : [];
+        children.push(react.createElement("div", { className: "menu-stub__list", key: "list" },
+          items.map((item) => react.createElement("button", {
+            type: "button",
+            key: item.id,
+            className: "menu-stub__item",
+            onClick: () => props.onSelect(item.id),
+          }, item.label))));
+      }
+      return react.createElement("span", { className: "menu-stub" }, children);
+    },
+    Button(props) {
+      // ⚠️ 必须把 children 透传：丢掉它按钮就成了空标签，
+      //    "有「恢复默认」按钮"这类断言会永远失败（而且看不出原因）。
+      const { variant, size, icon, children, ...rest } = props ?? {};
+      return react.createElement("button", Object.assign({ type: "button" }, rest), children);
+    },
+    IconChevronDownOutlineRegular(props) {
+      return react.createElement("svg", props ?? {});
+    },
+    /**
+     * 瞬时反馈尾部的两个图标（成功勾 / 失败叉）。
+     *
+     * ⚠️ 这两个**必须提供**，否则产品里 `IconCheckOutlineRegular === null` 的降级分支
+     *    会把图标整个跳过 —— 于是"有没有渲染图标"的断言会永远看不到图标（假通过）。
+     *    名字按宿主 asar 里的真实导出名。
+     */
+    IconCheckOutlineRegular(props) {
+      return react.createElement("svg", Object.assign({ "data-icon": "check" }, props ?? {}));
+    },
+    IconCloseOutlineRegular(props) {
+      return react.createElement("svg", Object.assign({ "data-icon": "close" }, props ?? {}));
+    },
+    /**
+     * 官方 Switch 桩，签名与宿主交付一致：
+     *   `Switch({ checked, onChange, label, disabled })` → `<button role="switch" aria-checked>`
+     *   **`onChange` 收到的是新值**（真实现是 `onClick: () => onChange(!checked)`）。
+     */
+    Switch(props) {
+      const { checked, onChange, label, disabled, ...rest } = props ?? {};
+      return react.createElement("button", Object.assign({
+        type: "button",
+        role: "switch",
+        "aria-checked": checked === true,
+        "aria-label": label,
+        "data-switch": checked === true ? "1" : "0",
+        // 布尔属性按真 DOM 语义挂（renderElement 会写成 DOM 属性而非 attribute）。
+        disabled: disabled === true,
+        // ⚠️ 必须把 onChange 转成 onClick 挂上去：只解构不接的话，
+        //    测试里 `node.handlers.onClick` 不存在，点开关会直接抛错。
+        onClick: typeof onChange === "function" ? () => onChange(checked !== true) : undefined,
+      }, rest), null);
+    },
+  };
   const plugin = registration.factory((spec) => {
     if (spec === "react") return react;
     // 真宿主里 react-dom 是平台种子词；桩件只要 createPortal（组件唯一的用法）。
     if (spec === "react-dom") return { createPortal: react.createPortal };
+    if (spec === "@deepseek-ai/dsh-client-ui-primitives") {
+      // ⚠️ `omitPrimitives` 用于验证**降级纪律**：故意抽掉某个原语后，
+      //    产品必须跳过设置卡片（而不是渲染出"有标签没控件"的空行）。
+      //    没有这条注入口，"门禁里漏掉一个 Switch === null"这类缺陷测不出来。
+      const omitted = Array.isArray(options.omitPrimitives) ? options.omitPrimitives : [];
+      const pruned = {};
+      for (const key of Object.keys(primitives)) {
+        if (omitted.indexOf(key) >= 0) continue;
+        pruned[key] = primitives[key];
+      }
+      return pruned;
+    }
     throw new Error(`测试台没有为 require(${JSON.stringify(spec)}) 准备桩件`);
   });
   /** 触发所有 MutationObserver 桩（等价于"官方菜单刚出现"）。 */
@@ -783,7 +958,7 @@ export function loadBundle(bundlePath, document, options = {}) {
   };
   return {
     registration, plugin, react, window, document, observers, flushObservers,
-    flushFrames, advanceClock, clockNow,
+    flushFrames, advanceClock, clockNow, localStorage: localStorageStub, storageState,
   };
 }
 
