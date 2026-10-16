@@ -123,9 +123,11 @@ const constantNames = [
   "TRACK_HEIGHT",
   "KNOB_SIZE",
   "KNOB_RADIUS",
+  // CSS 数组里用到的圆角简写（左端 = 旋钮半径的真半圆 + 右端直角）。
+  // 必须排在 KNOB_RADIUS 之后：常量按本列表顺序在同一作用域里求值。
+  "FILL_RADIUS",
   // 连续运动引擎的参数（预览页的拖动逻辑要用同一套，否则观感与真插件不一致）
   "MOTION",
-  "MOTION_REDUCED",
   "RELEASE_PROJECT_S",
   "POINTER_SPEED_EMA",
   "POINTER_STALE_S",
