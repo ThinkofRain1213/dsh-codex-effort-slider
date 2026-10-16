@@ -1633,6 +1633,80 @@ section("48. 目录就绪：插件必须声明 remote / remote.session（参考�
     const pkg = JSON.parse(rf(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"));
     ok(Array.isArray(pkg.files) && pkg.files.indexOf("locale") >= 0,
       "[48] package.json 的 files 白名单含 locale（否则打包产物缺元数据）");
+
+    /**
+     * ⚠️⚠️ **`exports` 必须有 `./locale/*.json` 映射** —— 只把文件放进目录是不够的。
+     *
+     * 这条是**真机截图抓出来的**：`locale/` 目录有、两份 JSON 也合法，但插件列表
+     * 的标题仍显示成包名（英文键名），元数据完全没被读到。
+     *
+     * 原因在 DSH 的实现里（`dictionariesOf`）：
+     *
+     *     const resource = `${specifier}/locale/${entry.name}`;   // 如 "包名/locale/en.json"
+     *     const file = resolvePluginResource(resource, parentURL);
+     *
+     * 而 `resolvePluginResource` 走的是**Node 的 ESM 解析器**
+     * （`ModuleLoader.fromInternal().resolveSync(...)`）。ESM 下只要 `package.json`
+     * 声明了 `exports`，**任何未列出的子路径都被封死** —— 解析 `包名/locale/en.json`
+     * 会抛 `ERR_PACKAGE_PATH_NOT_EXPORTED`，DSH 把它当"资源缺失"静默跳过。
+     *
+     * 所以这三件事必须同时成立，缺一不可：
+     *   ① `locale/en.json` + `locale/zh.json` 文件在
+     *   ② `files` 白名单含 `locale`（打包产物里带着）
+     *   ③ **`exports` 含 `./locale/*.json`**（能被解析到）← 最容易漏的一条
+     */
+    ok(pkg.exports && typeof pkg.exports === "object", "[48] package.json 声明了 exports");
+    {
+      const key = "./locale/*.json";
+      const has = pkg.exports && Object.prototype.hasOwnProperty.call(pkg.exports, key);
+      ok(has, `[48] ★ exports 含 "${key}"（缺了它 ESM 解析 包名/locale/en.json 会抛 PATH_NOT_EXPORTED）`);
+      if (has) {
+        eq(pkg.exports[key], "./locale/*.json", "[48] 该映射指回自身目录（保留 locale 子目录结构）");
+      }
+      /**
+       * 真解析一遍：用 Node 自己的解析规则，而不是只看字段在不在。
+       *
+       * ⚠️ 这里**必须自建一个 node_modules 软链**再解析：`createRequire` 的 base 若指向
+       *    仓库自身，`dsh-codex-effort-slider/locale/en.json` 会因为"包名不在
+       *    node_modules 里"而解析失败 —— 那是**测试环境的假失败**，与 exports 无关。
+       *    真机上包一定在 profile 的 node_modules 下（link: 或安装）。
+       */
+      const { createRequire } = await import("node:module");
+      const { mkdtempSync, mkdirSync, symlinkSync, rmSync, writeFileSync } = await import("node:fs");
+      const { tmpdir } = await import("node:os");
+      const path = await import("node:path");
+      const repoRoot = fileURLToPath(new URL("..", import.meta.url));
+      const sandbox = mkdtempSync(path.join(tmpdir(), "ces-exports-"));
+      try {
+        const nm = path.join(sandbox, "node_modules");
+        mkdirSync(nm, { recursive: true });
+        symlinkSync(repoRoot, path.join(nm, "dsh-codex-effort-slider"), "junction");
+        const req = createRequire(path.join(sandbox, "index.js"));
+
+        // ① 正向：正式包名下的 locale 子路径必须能解析。
+        for (const lang of ["en", "zh"]) {
+          let resolved = null;
+          try { resolved = req.resolve(`dsh-codex-effort-slider/locale/${lang}.json`); } catch (error) { resolved = null; }
+          ok(resolved !== null && path.basename(resolved) === `${lang}.json`,
+            `[48] ★ 包名/locale/${lang}.json 能被 Node 解析到（DSH 就是这么读元数据的）`);
+        }
+
+        // ② 反向对照：另造一个**只缺那条映射**的包，同一个解析必须失败 ——
+        //    证明上面两条断言不是"恒真"，而是真的在守 exports。
+        const stripped = JSON.parse(rf(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"));
+        delete stripped.exports["./locale/*.json"];
+        delete stripped.name;
+        const probe = path.join(nm, "probe-no-locale-exports");
+        mkdirSync(path.join(probe, "locale"), { recursive: true });
+        writeFileSync(path.join(probe, "package.json"), JSON.stringify(stripped, null, 2));
+        writeFileSync(path.join(probe, "locale", "en.json"), '{"meta":{"title":"x","description":"y"}}');
+        let brokenResolved = null;
+        try { brokenResolved = req.resolve("probe-no-locale-exports/locale/en.json"); } catch (error) { brokenResolved = null; }
+        eq(brokenResolved, null, "[48] 反向对照：去掉该 exports 映射后，同一个子路径解析必失败");
+      } finally {
+        try { rmSync(sandbox, { recursive: true, force: true }); } catch (error) { /* 清理失败无妨 */ }
+      }
+    }
   }
 }
 
