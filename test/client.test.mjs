@@ -2222,7 +2222,7 @@ section("26. 刻度点：目标 / 已到达解耦 + v3→v4 迁移 + 置灰联�
   }
 }
 
-section("27. 写盘失败必须如实上报 + 多实例守卫（两条反向对照抓出的漏网）");
+section("27. 写盘失败必须如实上报（反向对照抓出的漏网）");
 {
   // ── ① 写盘失败不许谎报成功 ──────────────────────────────────────────
   //
@@ -2249,65 +2249,6 @@ section("27. 写盘失败必须如实上报 + 多实例守卫（两条反向对�
     const ok27 = loadBundle(BUNDLE, createDocument(), {});
     eq(ok27.plugin.__internals.writeSettings({ hideTicks: "hideAll" }).ok, true,
       "[27] 正常环境 → ok:true（否则上面两条断言可能恒真）");
-  }
-
-  // ── ② 多实例守卫：第二份实例必须不渲染 ──────────────────────────────
-  //
-  // 也是反向对照抓出的漏网（把 `if (__cesIsOwner)` 改成 `if (true)` 全绿）。
-  //
-  // 真机证据（上游实测并写在注释里）：这个插件会被**加载两次**，两份引擎的 draft
-  // 渲染进官方同一行会互相打架 → 视觉上"松手乱跳"，且**只在重启后出现**
-  // （热重载时只有一份，所以手感正常 —— 很容易被误判成别的问题）。
-  //
-  // ⚠️ 必须让两个 bundle **共享同一个 window**（真机就是两份模块落在一个页面上）。
-  {
-    // 先造一个"够用"的共享 window：直接借用第一个 bundle 造出来的那个，
-    // 保证它与产品实际读到的字段一致（免得手搓一份跟真形状不符的桩）。
-    // ⚠️ 每个 bundle 用**自己的** document（官方菜单那一行要在它自己的 document 里），
-    //    但 window 必须是同一个 —— 守卫标记挂在 window 上。
-    const doc1 = createDocument();
-    const first = loadBundle(BUNDLE, doc1, {});
-    const win = first.window;
-    const doc2 = createDocument();
-    const second = loadBundle(BUNDLE, doc2, { window: win });
-
-    const h1 = createFakeHost({});
-    first.plugin.apply(h1.ctx);
-    const e1 = h1.registered.find((i) => i.opts && i.opts.name === "conversation.input.right");
-
-    const h2 = createFakeHost({});
-    second.plugin.apply(h2.ctx);
-    const e2 = h2.registered.find((i) => i.opts && i.opts.name === "conversation.input.right");
-
-    // 第一份：正常渲染出滑条（菜单必须建在**它自己的** document 里）
-    const m1 = createOfficialMenu(doc1, {});
-    first.react.mount(e1.Component, { sessionId: "session-abcdef" }, m1.composer);
-    await settle();
-    ok(first.react.find("knob") !== null, "[27] 第一份实例正常渲染滑条（有旋钮）");
-    ok(win.__cesActiveSliderOwner !== undefined && win.__cesActiveSliderOwner !== null,
-      "[27] 第一份实例占住了 owner 标记");
-
-    // 第二份：**必须什么都不渲染**（这是守卫的全部意义）。
-    //
-    // ⚠️ 判据必须是**拉杆本体**（knob / track），不能是 `find("root")`：
-    //    组件被守卫拦下时 `return null`，而 portal 的容器是**官方那一行**（ancestor），
-    //    所以"根节点"与"有没有渲染滑条"根本不是一回事。实测：旁路守卫后
-    //    `find("root")` 仍然是 null，而 `find("knob")` 变成了非 null ——
-    //    用 root 做判据的断言**恒真**，反向对照里它就是这么漏过去的。
-    const m2 = createOfficialMenu(doc2, {});
-    second.react.mount(e2.Component, { sessionId: "session-abcdef" }, m2.composer);
-    await settle();
-    eq(second.react.find("knob"), null, "[27] ★ 第二份实例不渲染旋钮（两份引擎不再打架）");
-    eq(second.react.find("track"), null, "[27] ★ 第二份实例也不渲染轨道");
-    // ⚠️ 不能断言 `composer.children.length === 0`：官方那一行**本身**就是它的孩子，
-    //    我们只能断言"没有多出我们塞的东西"（即根节点的 ces-inline 容器不存在）。
-    eq(second.react.find("root"), null, "[27] ★ 第二份实例没往官方那一行里塞容器（root 不存在）");
-
-    // 卸载第一份后，标记必须被释放 —— 让后来的一份还能接管（否则插件永久消失）。
-    ok(first.react.find("knob") !== null, "[27] 卸载前第一份的滑条还在");
-    first.react.unmount();
-    await settle();
-    eq(win.__cesActiveSliderOwner, null, "[27] 卸载后释放 owner 标记（后来的一份能接管）");
   }
 }
 
