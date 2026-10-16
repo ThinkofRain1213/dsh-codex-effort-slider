@@ -22,6 +22,7 @@
   "files": [
     "lib/index.js",
     "lib/client.js",
+    "locale",
     "cordis.patch.yml",
     "install-profile.ps1",
     "install.cmd",

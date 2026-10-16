@@ -1508,6 +1508,48 @@ section("48. 目录就绪：插件必须声明 remote / remote.session（参考�
   // 卡片注册用的 locale 命名空间必须与实际注册的一致（否则 t() 查不到词条）。
   ok(/ctx\.locale\.register\(SETTINGS_NS/.test(src), "[48] 词典按 SETTINGS_NS 注册");
   ok(/locale: SETTINGS_NS/.test(src), "[48] 卡片注册时声明同一个 SETTINGS_NS");
+
+  /**
+   * ⚠️ **locale/ 元数据目录必须在仓库里存在。**
+   *
+   * 这条是踩出来的：`dictionariesOf` 会对 `locale/` 做 `readdirSync`，
+   * 目录不存在时 DSH 的插件列表**整行报红**：
+   *
+   *   Plugin metadata for dsh-codex-effort-slider: Error: ENOENT: no such file
+   *   or directory, scandir '...\dsh-codex-effort-slider\locale'
+   *
+   * 而且它**不会自己好**：DSH 启动时扫一次，所以缺了就得重启才看得见后果。
+   *
+   * 更隐蔽的是它的成因：从 `b980f08`（基线，不含 locale）建分支时，
+   * git 会把 `a12b2b1` 里 tracked 的 `locale/` 一起删掉 —— 而 `git status`
+   * 看起来是**干净的**（工作区正好等于基线）。所以只有一条显式断言能拦住它。
+   */
+  {
+    const { existsSync, readFileSync: rf, readdirSync } = await import("node:fs");
+    const { fileURLToPath } = await import("node:url");
+    const localeDir = fileURLToPath(new URL("../locale", import.meta.url));
+    ok(existsSync(localeDir), "[48] locale/ 元数据目录存在（缺了插件列表会整行报 ENOENT）");
+    if (existsSync(localeDir)) {
+      const files = readdirSync(localeDir).filter((f) => f.endsWith(".json")).sort();
+      eq(files.join(","), "en.json,zh.json", "[48] locale/ 里正好是中英两份词条");
+      // 两份都要有 meta.title —— DSH 的插件列表就是读它当标题的。
+      for (const f of files) {
+        let parsed = null;
+        try { parsed = JSON.parse(rf(`${localeDir}/${f}`, "utf8")); } catch (error) { parsed = null; }
+        ok(parsed !== null, `[48] ${f} 是合法 JSON`);
+        if (parsed) {
+          ok(parsed.meta && typeof parsed.meta.title === "string" && parsed.meta.title.length > 0,
+            `[48] ${f} 有 meta.title（列表标题读的就是它）`);
+          ok(parsed.meta && typeof parsed.meta.description === "string" && parsed.meta.description.length > 0,
+            `[48] ${f} 有 meta.description`);
+        }
+      }
+    }
+    // 打包白名单必须包含 locale，否则 `npm run pack` / 发布产物里会漏掉它。
+    const pkg = JSON.parse(rf(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"));
+    ok(Array.isArray(pkg.files) && pkg.files.indexOf("locale") >= 0,
+      "[48] package.json 的 files 白名单含 locale（否则打包产物缺元数据）");
+  }
 }
 
 /* ══════════════════════════════════════════════════════════════════════ */
