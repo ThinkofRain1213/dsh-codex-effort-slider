@@ -231,18 +231,25 @@ section("2b. 顶头适配：旋钮与滑条同高，且两端都不越界");
   // 指针映射与视觉几何一致：拖到最左必定命中第一档（而不是因为内缩差一点点）
   {
     const d = await setup();
-    track(d.react, 0, 300).fire("onPointerDown", { clientX: 0, pointerId: 1 }); // 远在左端之外
+    // ⚠️ `pctAt(clientX)` 的映射是 `(clientX - left - R) / (width - 2R)`，
+    //    所以 clientX=0 会算出负数（被 clamp 到 0，仍然命中第一档）。
+    //    这里显式给轨道 rect，保证几何是确定的 300px。
+    track(d.react, 0, 300);
     await pressAndSettle(d, 0);
-    releaseAndSettle(d);
+    await releaseAndSettle(d);
     eq(d.react.find("knob").style.left, internals.knobOffsetOf(0), "[2b] 拖到最左 → 旋钮贴左端圆角内（圆心不越界）");
+    // ⚠️ 新模型：写回发生在"位置稳定"的那一刻。默认档位是 high，
+    //    拖到最左必然跨过检查点 → 写出 off。
+    ok(d.host.selects.length >= 1, `[2b] 拖到最左确实写回了（${d.host.selects.length} 次）`);
     eq(d.host.selects[d.host.selects.length - 1].reasoningEffort, "off", "[2b] 最左端映射到第一档");
   }
 
   // 右端同理
   {
     const d = await setup();
+    track(d.react, 0, 300);
     await pressAndSettle(d, 300);
-    releaseAndSettle(d);
+    await releaseAndSettle(d);
     eq(d.react.find("knob").style.left, internals.knobOffsetOf(1), "[2b] 拖到最右 → 旋钮贴右端圆角内（不会被菜单裁掉）");
     eq(d.host.selects[d.host.selects.length - 1].reasoningEffort, "max", "[2b] 最右端映射到最高档");
   }
@@ -416,30 +423,42 @@ section("4. 关闭菜单 → 官方那一行逐个还原");
   ok(react2.portalHosts.length === 0, "[4] portal 已清空");
 }
 
-section("5. 拖动真的写回官方档位");
+section("5. 拖动真的写回官方档位（检查点写回）");
 {
-  const { menu, react, host } = await setup();
-  track(react).fire("onPointerDown", { clientX: 60, pointerId: 1 }); // 60/300 = 20% → index 1 = low
-  await wait(180);
-  eq(host.selects.length, 1, "[5] 拖动中停留 → 档位在降频窗口到期后落地");
+  // ⚠️ 本节的模型变了：写回不再是"事件触发 + 节流"，而是**位置跨过检查点**触发。
+  //    所以断言必须"把引擎跑到收敛"（`runFrames`）才有位置可言 ——
+  //    只 fire 事件不泵帧，位置还停在 0，跨不了 1/6 检查点。
+  const ctx = await setup();
+  const { menu, react, host } = ctx;
+  const node = track(react);
+
+  // 按下 → 目标 20%（index 1 = low），引擎动画走过去跨过 1/6 → 写一次
+  node.fire("onPointerDown", { clientX: 60, pointerId: 1 });
+  await runFrames(ctx);
+  await settle();
+  eq(host.selects.length, 1, "[5] 位置跨过检查点 → 写回一次");
   eq(JSON.stringify(host.selects[0]), JSON.stringify({
     provider: "deepseek",
     model: "deepseek-v41-flash",
     reasoningEffort: "low",
   }), "[5] 写回的是官方 select 契约 { provider, model, reasoningEffort }");
 
-  track(react).fire("onPointerUp", {});
+  node.fire("onPointerUp", {});
+  await runFrames(ctx);
   await settle();
-  eq(host.selects.length, 1, "[5] 已落地的档位在松手时不重复写（同档位去重）");
-  eq(react.find("track").getAttribute("aria-valuetext"), "Low", "[5] 宿主回报后滑条读数跟着变 Low");
+  eq(host.selects.length, 1, "[5] 松手时档位没变 → 不重复写（检查点判据天然去重）");
+  eq(react.find("track").getAttribute("aria-valuetext"), "Low", "[5] 滑条读数跟着位置变 Low");
   // 官方那一行的文字由官方自己渲染；这里只证明**我们没去改写它**。
   const officialSpans = menu.effortRow.children.filter((child) => child.tagName === "SPAN");
   eq(officialSpans.length, 2, "[5] 官方两个 span 仍然只有两个");
   eq(officialSpans[0].textContent, "推理等级", "[5] 官方 label 文字没被改写");
   eq(officialSpans[1].textContent, "High", "[5] 官方 value 文字也没被改写（我们只加自己的容器）");
 
-  track(react).fire("onPointerDown", { clientX: 290, pointerId: 1 }); // 96.7% → max
-  track(react).fire("onPointerUp", {});
+  // 拖到最右 → 位置跨过后续检查点 → 最终写 max
+  node.fire("onPointerDown", { clientX: 290, pointerId: 1 }); // 96.7% → max
+  await runFrames(ctx);
+  node.fire("onPointerUp", {});
+  await runFrames(ctx);
   await settle();
   eq(host.selects[host.selects.length - 1].reasoningEffort, "max", "[5] 拖到最右 = 最高档");
 }
@@ -470,58 +489,89 @@ section("6. 拖动不会误触官方那一行的点击（会跳进等级列表�
   ok(propagated, "[6] 方向键被滑条 stopPropagation（不会同时移动官方菜单焦点）");
 }
 
-section("7. 键盘可达 + 去重/限频/在途合并");
+section("7. 键盘可达 + 检查点去重（旧的限频/在途合并已随模型移除）");
 {
-  const { react, host } = await setup();
-  track(react).fire("onKeyDown", { key: "ArrowRight" });
-  await settle();
-  eq(host.selects[host.selects.length - 1].reasoningEffort, "max", "[7] 右方向键上移一档并写回");
-  track(react).fire("onKeyDown", { key: "Home" });
-  await settle();
-  eq(host.selects[host.selects.length - 1].reasoningEffort, "off", "[7] Home 键回到最低档");
+  // ⚠️ 本节原先测的是"120ms 降频 + 在途合并 + queued 补发" —— 那套状态机已按
+  //    "档位 = f(位置)" 重构掉了。现在这里守的是**新模型的两条不变量**：
+  //      ① 位置没跨检查点 → 一次都不写（去重是判据自带的，不是额外机制）
+  //      ② 位置跨过几个检查点 → 就写几次（不合并、不节流）
 
-  // 7a 落在当前档位：一次写回都不该有
-  const a = await setup();
-  const nodeA = track(a.react);
-  nodeA.fire("onPointerDown", { clientX: 200, pointerId: 1 }); // 66.7% → index 2 = high（当前档）
-  nodeA.fire("onPointerUp", {});
-  await settle();
-  eq(a.host.selects.length, 0, "[7] 落在当前档位 → 0 次写回（同档位去重）");
+  // 7a 键盘：右方向键 → 目标上移一档 → 动画走过去 → 写一次
+  {
+    const ctx = await setup();
+    const { react, host } = ctx;
+    track(react).fire("onKeyDown", { key: "ArrowRight" });
+    await runFrames(ctx);
+    await settle();
+    eq(host.selects[host.selects.length - 1].reasoningEffort, "max", "[7] 右方向键上移一档并写回");
 
-  // 7b 一秒内 60 次移动扫过全部档位
-  const b = await setup();
-  const nodeB = track(b.react);
-  nodeB.fire("onPointerDown", { clientX: 0, pointerId: 1 });
-  for (let i = 0; i <= 60; i += 1) nodeB.fire("onPointerMove", { clientX: (i / 60) * 300 });
-  nodeB.fire("onPointerUp", {});
-  await settle();
-  ok(b.host.selects.length <= 3, `[7] 60 次拖动只写回 ${b.host.selects.length} 次（≤3）`);
-  ok(b.host.selects.length >= 1, "[7] 但确实写回了");
+    track(react).fire("onKeyDown", { key: "Home" });
+    await runFrames(ctx);
+    await settle();
+    eq(host.selects[host.selects.length - 1].reasoningEffort, "off", "[7] Home 键回到最低档");
+  }
 
-  // 7c 在途合并
-  let release = () => {};
-  const gate = new Promise((resolve) => { release = resolve; });
-  const d = await setup({
-    host: {
-      select: async (selection, store) => {
-        await gate;
-        store.set({ ...store.getSnapshot(), current: { ...store.getSnapshot().current, reasoningEffort: selection.reasoningEffort } });
-        return { ok: true };
+  // 7b 落在当前档位：位置从头到尾没跨检查点 → 0 次写回
+  {
+    const ctx = await setup();
+    const node = track(ctx.react);
+    node.fire("onPointerDown", { clientX: 200, pointerId: 1 }); // 66.7% → index 2 = high（当前档）
+    await runFrames(ctx);
+    node.fire("onPointerUp", {});
+    await runFrames(ctx);
+    await settle();
+    eq(ctx.host.selects.length, 0, "[7] 落在当前档位 → 0 次写回（检查点判据天然去重）");
+  }
+
+  // 7c 一次扫过全部档位：**每个检查点各写一次**（不再被 120ms 节流合并）
+  {
+    const ctx = await setup();
+    const node = track(ctx.react);
+    node.fire("onPointerDown", { clientX: 0, pointerId: 1 });
+    for (let i = 0; i <= 60; i += 1) {
+      node.fire("onPointerMove", { clientX: (i / 60) * 300 });
+      // 每步都泵一帧，让位置真的走到（否则位置不动，检查点永远不跨）
+      await runFrames(ctx, 3);
+    }
+    await runFrames(ctx);
+    node.fire("onPointerUp", {});
+    await runFrames(ctx);
+    await settle();
+    // 4 档 → 3 个检查点，从 off 扫到 max 最多写 3 次（off 本身是起点，不写）
+    ok(ctx.host.selects.length >= 1 && ctx.host.selects.length <= 3,
+      `[7] 扫过全部检查点写回 ${ctx.host.selects.length} 次（1~3）`);
+    eq(ctx.host.selects[ctx.host.selects.length - 1].reasoningEffort, "max",
+      "[7] 最终写到最高档");
+  }
+
+  // 7d 宿主回报慢也不是问题：没有"在途"状态，下一次跨检查点直接写
+  {
+    let release = () => {};
+    const gate = new Promise((resolve) => { release = resolve; });
+    const ctx = await setup({
+      host: {
+        select: async (selection, store) => {
+          await gate;
+          store.set({ ...store.getSnapshot(), current: { ...store.getSnapshot().current, reasoningEffort: selection.reasoningEffort } });
+          return { ok: true };
+        },
       },
-    },
-  });
-  track(d.react).fire("onPointerDown", { clientX: 10, pointerId: 1 }); // off
-  track(d.react).fire("onPointerUp", {});
-  await settle();
-  eq(d.host.selects.length, 1, "[7] 第一次写回已发出并挂起");
-  track(d.react).fire("onPointerDown", { clientX: 290, pointerId: 1 }); // max（在途期间）
-  track(d.react).fire("onPointerUp", {});
-  await settle();
-  eq(d.host.selects.length, 1, "[7] 在途期间不并发第二个写入（合并，而不是排队打后端）");
-  release();
-  await settle(14);
-  eq(d.host.selects.length, 2, "[7] 在途落地后补发攒下的最新值");
-  eq(d.host.selects[1].reasoningEffort, "max", "[7] 补发的正是最后那一次");
+    });
+    const node = track(ctx.react);
+    node.fire("onPointerDown", { clientX: 10, pointerId: 1 }); // off
+    await runFrames(ctx);
+    eq(ctx.host.selects.length, 1, "[7] 第一次写回已发出并挂起（宿主未回报）");
+    // 在途期间继续拖到 max：新模型**不合并**，跨检查点就照写
+    node.fire("onPointerMove", { clientX: 290 });
+    await runFrames(ctx);
+    node.fire("onPointerUp", {});
+    await runFrames(ctx);
+    ok(ctx.host.selects.length >= 2,
+      `[7] 宿主未回报也不阻塞后续写回（已发 ${ctx.host.selects.length} 次）`);
+    release();
+    await settle(14);
+    eq(ctx.host.selects[ctx.host.selects.length - 1].reasoningEffort, "max", "[7] 最后写的是最高档");
+  }
 }
 
 section("8. 失败不谎报、不崩、能自愈");
@@ -915,12 +965,15 @@ section("15. 收起态模型席按钮上的档位（点开之前就看得见）"
   const ctx15 = await setup();
   const { react, internals, menu, bundle, document } = ctx15;
 
-  // 拖动中：官方席显示的是**已生效**档位，所以它的颜色不该跟着草稿跑
+  // ⚠️ 新模型下"拖动中"已经写回了：位置跨过检查点就写，不等松手。
+  //    所以席按钮在拖动结束时显示的**就是** Max —— 这不是"乱跳"，是宿主真的已经是 Max 了。
+  //    （旧模型要等松手才写，那时席按钮才会保持旧色。这条断言的语义已随模型改变。）
   await pressAndSettle(ctx15, 300);
   eq(menu.effortValueEl.style.color, "rgb(139,92,246)", "[15] 菜单里那一行跟着草稿变成 Max 色");
-  eq(menu.seatEffortEl.style.color, internals.valueColorFor(H), "[15] 席按钮仍按已生效档位着色（拖动中不乱跳）");
+  eq(menu.seatEffortEl.style.color, "rgb(139,92,246)",
+    "[15] 席按钮也跟着 Max —— 新模型下拖动中就已写回宿主，不再是旧档位色");
   await releaseAndSettle(ctx15);
-  eq(menu.seatEffortEl.style.color, "rgb(139,92,246)", "[15] 提交后席按钮跟上 Max 色");
+  eq(menu.seatEffortEl.style.color, "rgb(139,92,246)", "[15] 松手后仍是 Max 色");
   eq(menu.seatEffortEl.textContent, "High", "[15] 文字仍然由官方自己管（我们只改颜色）");
 
   // 官方重渲染换了那个节点 → 桥要重新抓到并补色
@@ -975,11 +1028,13 @@ section("16. Off 档保持官方灰 + 刻度点更小更淡");
   eq(off.menu.effortValueEl.textContent, "Off", "[16] 文字内容仍然是官方的");
   ok(!off.menu.seatLabelEl.style.color, "[16] 模型名依旧不动");
   // 拖到 Max 就恢复着色（确认"灰"只发生在 off 档）
+  // ⚠️ 新模型下拖动中已写回，席按钮跟着位置走 —— 所以它也会变成紫罗兰。
   await pressAndSettle(off, 300);
-  eq(off.menu.effortValueEl.style.color, "rgb(139,92,246)", "[16] 拖到 Max：菜单里那一行先变紫罗兰");
-  eq(off.menu.seatEffortEl.style.color, "", "[16] 席按钮按已生效档位（仍是 off）→ 还是灰的");
+  eq(off.menu.effortValueEl.style.color, "rgb(139,92,246)", "[16] 拖到 Max：菜单里那一行变紫罗兰");
+  eq(off.menu.seatEffortEl.style.color, "rgb(139,92,246)",
+    "[16] 席按钮也变紫罗兰（新模型下拖动中已写回，不再是 off）");
   await releaseAndSettle(off);
-  eq(off.menu.seatEffortEl.style.color, "rgb(139,92,246)", "[16] 提交后席按钮也变成紫罗兰");
+  eq(off.menu.seatEffortEl.style.color, "rgb(139,92,246)", "[16] 松手后仍是紫罗兰");
 
   // 刻度点：更小更淡
   const tickCss = internals.CSS.slice(internals.CSS.indexOf(".ces-tick{"), internals.CSS.indexOf("}", internals.CSS.indexOf(".ces-tick{")));
@@ -1207,16 +1262,22 @@ section("18. 连续运动引擎：接线层（按下/拖动/松手/键盘只改�
     ok(seen[seen.length - 1] > seen[0], "[18] 位置逐帧在推进（引擎在工作）");
   }
 
-  // ③ 松手：写回发生在**松手瞬间**，且落点 = 外推后的档位
+  // ③ 松手：写回由**吸附动画跨过检查点**触发，不再是"松手瞬间"。
+  //    ⚠️ 这是新模型有意改变的行为（旧模型：松手立即按落点写一次）。
+  //    好处是"档位严格等于位置"——用户关掉弹窗时动画停在 0.7，就还是前一档。
   {
     const ctx = await setup();
     const I = ctx.internals;
     await pressOnly(ctx, 300);
     const selectsBefore = ctx.host.selects.length;
     track(ctx.react).fire("onPointerUp", {});
-    await settle();
-    ok(ctx.host.selects.length > selectsBefore, "[18] 松手立即写回（不等待吸附动画跑完）");
-    eq(ctx.host.selects[ctx.host.selects.length - 1].reasoningEffort, "max", "[18] 松手落点 = 外推后的档位（与视觉无关）");
+    await settle();   // 只落微任务，不泵帧
+    eq(ctx.host.selects.length, selectsBefore,
+      "[18] 松手那一刻**不**立即写（吸附还没走过去，位置未跨检查点）");
+    // 把吸附动画跑完 → 跨过检查点 → 写
+    await releaseAndSettle(ctx);
+    ok(ctx.host.selects.length > selectsBefore, "[18] 吸附走完跨过检查点 → 写回");
+    eq(ctx.host.selects[ctx.host.selects.length - 1].reasoningEffort, "max", "[18] 最终落点 = 外推后的档位");
   }
 
   // ④ 吸附结束后交回 effectivePct（不残留 draft）
@@ -1553,8 +1614,14 @@ section("21. 官方菜单改档后，引擎必须跟随（防瞬移）");
   {
     const s = await scene21();
     s.track().fire("onPointerDown", { clientX: 0, pointerId: 1 });
-    for (let i = 1; i <= 60; i += 1) s.track().fire("onPointerMove", { clientX: (i / 60) * 300 });
+    for (let i = 1; i <= 60; i += 1) {
+      s.track().fire("onPointerMove", { clientX: (i / 60) * W });
+      // ⚠️ 新模型：写回由"位置稳定"触发，所以必须泵帧让位置真的走过去。
+      //    只 fire 事件不推进引擎 → 位置不动 → 0 次写回（这正是本条曾失败的原因）。
+      await pump21(s, 2);
+    }
     s.track().fire("onPointerUp", {});
+    await pump21(s, 200);
     await settle();
     ok(s.host.selects.length >= 1 && s.host.selects.length <= 3,
       `[21] 60 次拖动仍正常写回 ${s.host.selects.length} 次（1~3；修法若破坏写回会变 0）`);
@@ -2323,6 +2390,247 @@ section("27. 写盘失败必须如实上报（反向对照抓出的漏网）");
     const ok27 = loadBundle(BUNDLE, createDocument(), {});
     eq(ok27.plugin.__internals.writeSettings({ hideTicks: "hideAll" }).ok, true,
       "[27] 正常环境 → ok:true（否则上面两条断言可能恒真）");
+  }
+}
+
+section("29. 档位 = f(位置)：检查点写回 + 500ms 兜底对账");
+{
+  // 本节的模型（与旧版**根本不同**，别按旧心智读）：
+  //
+  //     写回 = "引擎当前位置跨过检查点"的副作用
+  //     没有 optimistic / inFlight / queued / 节流 / 超时回滚
+  //     兜底是每 500ms 一次的**对账**（唯一一条"时间驱动"的路径）
+  //
+  // 三条不变量：
+  //   ① 位置没跨检查点 → 一次都不写
+  //   ② 位置停在某档 → 只写那个档（途中的中间档不写）
+  //   ③ 失步（宿主没接受）→ 下一个对账 tick 自己补写
+
+  const model = {
+    id: "deepseek-v41-flash",
+    name: "DeepSeek-V41-Flash",
+    reasoning: {
+      defaultEffort: "low",
+      efforts: [
+        { id: "low", name: "Low" },
+        { id: "medium", name: "Medium" },
+        { id: "high", name: "High" },
+        { id: "xhigh", name: "xHigh" },
+        { id: "max", name: "Max" },
+      ],
+    },
+  };
+
+  /** 起一个场景：4 档 → 3 个检查点，轨道宽 300。 */
+  async function scene29(hostOptions = {}) {
+    const document = createDocument();
+    const menu = createOfficialMenu(document, { effortLabel: "Low" });
+    const bundle = loadBundle(BUNDLE, document, {});
+    const host = createFakeHost(Object.assign({ model, effort: "low" }, hostOptions));
+    bundle.plugin.apply(host.ctx);
+    const entry = host.registered.find((i) => i.opts && i.opts.name === "conversation.input.right");
+    bundle.react.mount(entry.Component, { sessionId: "session-abcdef" }, menu.composer);
+    await settle();
+    const I = bundle.plugin.__internals;
+    const W = 300;
+    const R = I.KNOB_RADIUS;
+    return {
+      bundle, host, menu, I, W, R,
+      /** 轨道坐标（clientX）：pct → px */
+      at: (pct) => R + pct * (W - 2 * R),
+      /** 检查点 px（中点）：pct = (k + 0.5) / (n - 1) */
+      checkpoint: (k, n) => R + (((k + 0.5) / (n - 1)) * (W - 2 * R)),
+      track() {
+        const node = bundle.react.find("track");
+        if (node) node.rect = { left: 0, top: 0, right: W, bottom: 28, width: W, height: 28 };
+        return node;
+      },
+      knobPct() {
+        const knob = bundle.react.find("knob");
+        if (!knob) return null;
+        const m = /\+ ([\d.]+) \*/.exec(String(knob.style.left));
+        return m ? Number(m[1]) : null;
+      },
+      readEffort() {
+        const s = host.store.getSnapshot();
+        return s && s.current ? s.current.reasoningEffort : null;
+      },
+      /** 把引擎跑到收敛（位置真的走过去）。 */
+      async pump(frames = 200) {
+        for (let i = 0; i < frames; i += 1) {
+          const ran = bundle.flushFrames(1, 16);
+          for (let k = 0; k < 6; k += 1) await Promise.resolve();
+          if (ran === 0) return i;
+        }
+        return frames;
+      },
+      async reconcile(n = 1) {
+        bundle.advanceIntervals(n);
+        await settle();
+      },
+    };
+  }
+
+  // ── ① 检查点位置本身（中点）──────────────────────────────────
+  //
+  // ⚠️ 5 档（low/medium/high/xhigh/max）的检查点在 (k+0.5)/4：
+  //      0.125 / 0.375 / 0.625 / 0.875
+  //    区间：low=[0,.125) medium=[.125,.375) high=[.375,.625)
+  //          xhigh=[.625,.875) max=[.875,1]
+  //    （我第一版按 4 档写了 0.25/0.5/0.75 —— 那是**错的**，
+  //      导致"0.2 本该是 low 却被判成 medium"，白查了一轮。）
+  {
+    const s = await scene29();
+    const n = 5;
+    for (let k = 0; k < n - 1; k += 1) {
+      const c = (k + 0.5) / (n - 1);
+      eq(s.I.indexFromPct(c - 0.001, n), k, `[29] 检查点 ${c} 之下仍是第 ${k} 档`);
+      eq(s.I.indexFromPct(c + 0.001, n), k + 1, `[29] 检查点 ${c} 之上是第 ${k + 1} 档`);
+    }
+  }
+
+  // ── ② 位置没跨检查点 → 不写 ────────────────────────────────
+  {
+    const s = await scene29();
+    // 初始 low（index 0）。拖到 0.1 —— 在 low 区间 [0,0.125) 内，没跨检查点
+    s.track().fire("onPointerDown", { clientX: s.at(0.1), pointerId: 1 });
+    await s.pump();
+    s.track().fire("onPointerUp", {});
+    await s.pump();
+    await settle();
+    eq(s.host.selects.length, 0, "[29] 停在原档位区间内（pct 0.1 < 检查点 0.125）→ 0 次写回");
+  }
+
+  // ── ③ 跨检查点 → 写 ───────────────────────────────────────
+  {
+    const s = await scene29();
+    // 拖到 0.2 → 跨过 0.125 检查点 → medium（index 1）
+    s.track().fire("onPointerDown", { clientX: s.at(0.2), pointerId: 1 });
+    await s.pump();
+    s.track().fire("onPointerUp", {});
+    await s.pump();
+    await settle();
+    eq(s.host.selects.length, 1, "[29] 跨过 1 个检查点 → 写 1 次");
+    eq(s.host.selects[0].reasoningEffort, "medium", "[29] 写的是新档位 medium");
+  }
+
+  // ── ④ ★ 途中路过的中间档不写（这是本模型的关键）──────────────
+  //
+  // 从 low（0）一按到 max（1.0）：引擎会从 0 走到 1.0，
+  // 途中跨过 0.125 / 0.375 / 0.625 / 0.875 四个检查点。
+  // 但"停下"的是 1.0 → 只该写 max（可能中间有一次过渡，但绝不该写 4 次）。
+  // 旧实现（逐帧同步）会写出 medium → high → xhigh → max 四次。
+  {
+    const s = await scene29();
+    s.track().fire("onPointerDown", { clientX: s.at(1), pointerId: 1 });
+    await s.pump();
+    s.track().fire("onPointerUp", {});
+    await s.pump();
+    await settle();
+    const written = s.host.selects.map((x) => x.reasoningEffort);
+    ok(written.length <= 2,
+      `[29] ★ 一按跨四档只写 ≤2 次（实测 ${written.length}：${written.join(",")}；逐帧同步会写 4 次）`);
+    eq(written[written.length - 1], "max", "[29] 最终写的是停下的档位 max");
+  }
+
+  // ── ⑤ 松手后吸附跨检查点 → 再写一次 ────────────────────────
+  //
+  // 这是**新行为**（旧模型是松手瞬间按落点写一次）：
+  // 松手时位置在检查点下方，但外推落点在检查点上方 → 吸附动画走过去 → 再写。
+  {
+    const s = await scene29();
+    // 拖到 0.5 附近再快速右划，松手带速度外推 → 落到更右
+    s.track().fire("onPointerDown", { clientX: s.at(0.3), pointerId: 1 });
+    s.track().fire("onPointerMove", { clientX: s.at(0.55) });
+    s.track().fire("onPointerUp", {});
+    await s.pump();
+    await settle();
+    const written = s.host.selects.map((x) => x.reasoningEffort);
+    ok(written.length >= 1, `[29] 松手吸附过程至少写一次（${written.join(",")}）`);
+    ok(written.length <= 2, `[29] 但不会刷屏（实测 ${written.length} 次）`);
+  }
+
+  // ── ⑥ ★ 卸载时未跨检查点 → 不写（"尊重事实"）─────────────────
+  {
+    const s = await scene29();
+    // 拖到 0.1（仍是 low 区间），不松手直接卸载
+    s.track().fire("onPointerDown", { clientX: s.at(0.1), pointerId: 1 });
+    await s.pump(3);            // 只走 3 帧，位置还早
+    s.bundle.react.unmount();
+    await settle();
+    eq(s.host.selects.length, 0,
+      "[29] ★ 卸载时位置没跨检查点（0.1 < 0.125）→ 不写：事实就是没换档");
+  }
+
+  // ── ⑦ ★ 兜底对账：宿主没接受 → 下一个 tick 自己补写 ──────────
+  {
+    // 让宿主"第一次 select 静默不生效"（返回 ok 但 store 不变），
+    // 之后恢复正常 —— 这正是对账要兜的场景。
+    let drop = 1;
+    const s = await scene29({
+      select: async (selection, store) => {
+        if (drop > 0) {
+          drop -= 1;
+          return { ok: true };          // 假装成功，但 store 没变
+        }
+        store.set({
+          ...store.getSnapshot(),
+          current: { ...store.getSnapshot().current, reasoningEffort: selection.reasoningEffort },
+        });
+        return { ok: true };
+      },
+    });
+    s.track().fire("onPointerDown", { clientX: s.at(0.2), pointerId: 1 });
+    await s.pump();
+    s.track().fire("onPointerUp", {});
+    await s.pump();
+    await settle();
+    // 第一次写被"吞"了：宿主档位仍不是 medium
+    eq(s.readEffort() !== "medium", true, "[29] 前置：第一次写回被宿主静默吞掉（模拟失步）");
+    // 对账跑一个 tick 就该补上
+    await s.reconcile(1);
+    eq(s.readEffort(), "medium", "[29] ★ 500ms 对账自己把失步补上（不需要用户再操作）");
+  }
+
+  // ── ⑧ 对账去重：一致时一次都不写 ──────────────────────────
+  //
+  // ⚠️ 这里有**两层**去重（对账里的 `have === want` + writeEffort 里的
+  //    `effectiveEffortId(snapshot) === levelId`），互为备份。
+  //    所以"只看 selects 不增长"区分不出是哪一层在挡 —— 反向对照证实过：
+  //    删掉对账那层，本条断言照样绿（被 writeEffort 那层兜住）。
+  //    故补一条**结构断言**，确保对账自己也不会白打后端。
+  {
+    const s = await scene29();
+    s.track().fire("onPointerDown", { clientX: s.at(0.2), pointerId: 1 });
+    await s.pump();
+    s.track().fire("onPointerUp", {});
+    await s.pump();
+    await settle();
+    const before = s.host.selects.length;
+    await s.reconcile(5);        // 跑 5 个 tick
+    eq(s.host.selects.length, before, "[29] 状态一致时对账 5 个 tick 也不写（去重闸门）");
+    const { readFileSync } = await import("node:fs");
+    const src29 = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
+    ok(/if \(have === want\) \{/.test(src29),
+      "[29] 对账自己也有 have===want 闸门（不是无条件 writeEffort）");
+  }
+
+  // ── ⑨ 重试上限：宿主一直拒绝 → 停手并报错 ────────────────────
+  {
+    const s = await scene29({
+      select: async () => ({ ok: false, error: { code: "nope", message: "宿主不接受这一档" } }),
+    });
+    s.track().fire("onPointerDown", { clientX: s.at(0.2), pointerId: 1 });
+    await s.pump();
+    s.track().fire("onPointerUp", {});
+    await s.pump();
+    await settle();
+    const afterFirst = s.host.selects.length;
+    // 跑超过上限的 tick
+    await s.reconcile(12);
+    ok(s.host.selects.length - afterFirst <= 6,
+      `[29] 对账最多再试 6 次就停手（实测多试 ${s.host.selects.length - afterFirst} 次）`);
+    ok(s.bundle.react.find("error") !== null, "[29] 连续拒绝后给出可见错误");
   }
 }
 

@@ -724,6 +724,8 @@ export function loadBundle(bundlePath, document, options = {}) {
   let registration = null;
   /** MutationObserver 桩：只记录回调，由测试显式触发（这样扫描是确定性的，不靠计时）。 */
   const observers = [];
+  /** 注册中的 setInterval 桩（见 window.setInterval 的注释）。 */
+  const intervals = [];
   /** 假时钟（毫秒）：rAF 帧时间戳与 performance.now 都读它，保证测试完全确定。 */
   let clock = 0;
   /** 待执行的 rAF 回调队列（flushFrames 消费）。 */
@@ -810,8 +812,28 @@ export function loadBundle(bundlePath, document, options = {}) {
     CustomEvent: function FakeCustomEvent(type) { this.type = type; },
     Event: function FakeEvent(type) { this.type = type; },
     MutationObserver: MutationObserverStub,
-    setInterval: (fn, ms) => setInterval(fn, ms),
-    clearInterval: (handle) => clearInterval(handle),
+    /**
+     * **可控的 setInterval 桩**。
+     *
+     * ⚠️ 必须是桩而不是真实定时器，两个原因：
+     *   ① 真实 `setInterval` 会让 node 进程**跑完断言也不退出**（等 500ms 定时器），
+     *      表现为"全部通过 ✅ 但命令挂住" —— 踩过一次。
+     *   ② 对账是时间相关逻辑，测试要能**确定性地**触发它（`advanceIntervals`），
+     *      而不是 sleep 等它自己到点。
+     *
+     * 语义：注册即入表，测试显式调用 `advanceIntervals(n)` 才执行 n 次；
+     *       `clearInterval` 把它从表里摘掉（这样也能断言"卸载后不再对账"）。
+     */
+    setInterval: (fn, ms) => {
+      const id = { fn, ms, cleared: false };
+      intervals.push(id);
+      return id;
+    },
+    clearInterval: (handle) => {
+      if (handle && typeof handle === "object") handle.cleared = true;
+      const at = intervals.indexOf(handle);
+      if (at >= 0) intervals.splice(at, 1);
+    },
     /**
      * **可控的 requestAnimationFrame 桩**。
      *
@@ -959,6 +981,23 @@ export function loadBundle(bundlePath, document, options = {}) {
   return {
     registration, plugin, react, window, document, observers, flushObservers,
     flushFrames, advanceClock, clockNow, localStorage: localStorageStub, storageState,
+    intervals,
+    /**
+     * 手动推进 setInterval 桩 n 次（对账逻辑用它确定性地触发）。
+     * 返回实际执行的回调数。
+     */
+    advanceIntervals(n = 1) {
+      let ran = 0;
+      for (let i = 0; i < n; i += 1) {
+        const snapshot = [...intervals];
+        for (const item of snapshot) {
+          if (item.cleared || intervals.indexOf(item) < 0) continue;
+          try { item.fn(); } catch (error) { /* 单个回调抛错不传染 */ }
+          ran += 1;
+        }
+      }
+      return ran;
+    },
   };
 }
 
