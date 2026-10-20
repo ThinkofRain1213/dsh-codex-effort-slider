@@ -682,7 +682,20 @@ section("11. 结构上不存在消息注入（防同类插件的致命 bug）");
 {
   const { host, plugin } = await setup();
   eq(host.subscriptions.length, 0, "[11] 没有 ctx.on(...) —— 不监听任何宿主钩子");
-  ok(host.registered.length === 1, "[11] 只做了一件事：注册一个插槽条目");
+  /**
+   * 注册的插槽条目：滑条那一席 + 设置卡片那一席。
+   *
+   * ⚠️ 这条原来断言「只有 1 个」（上游只有滑条）。本版多了一个
+   *    `plugins.bundle.config`（设置卡片）—— 那是**配置界面**，不是
+   *    会话/消息面，所以「结构上不存在消息注入」这条原则依然成立。
+   *    改成按**槽位名**断言，比数数量更精确：
+   *    只允许这两个槽位，出现别的就说明插件动了不该动的地方。
+   */
+  eq(host.registered.length, 2,
+    `[11] 注册两个槽位条目：滑条 + 设置卡片（实测 ${host.registered.length}）`);
+  const slotNames = host.registered.map((r) => r.opts && r.opts.name).sort();
+  eq(slotNames.join(","), "conversation.input.right,plugins.bundle.config",
+    "[11] ★ 只注册这两个槽位（滑条 + 配置卡片），没有别的");
   ok(CODE.indexOf("session.append") < 0 && CODE.indexOf(".append(") < 0, "[11] 代码里没有任何会话 append（除了给那一行 append 容器）");
   ok(CODE.indexOf('role: "user"') < 0 && CODE.indexOf('"user/message"') < 0, "[11] 不构造 user 消息");
   ok(CODE.indexOf("producer-owned") < 0, "[11] 不触碰 V4 会话准入面");
@@ -2054,6 +2067,234 @@ section("55. ★ manifest：locale 声明（词条能生效的硬前置）");
     "[55] locale/zh.json 有 meta.title");
   ok(zh.meta.title.indexOf("推理") >= 0,
     `[55] 中文 title 是「${zh.meta.title}」（不是包名）`);
+}
+
+section("56. ★ 设置卡片真的能用：槽位注册 + 词条 + 四项渲染 + 恢复默认");
+{
+  // ⚠️ 本节是目标 ④「移入设置卡片」的**真正验收**。
+  //
+  //    在此之前，测试台没有原语桩 → 卡片走"原语不可用就跳过"降级分支，
+  //    387 行卡片代码**从未被执行**（日志里"跳过设置卡片"出现 68 次）。
+  //    本轮补了原语桩 + ctx.effect + ctx.locale，卡片才真正跑起来，
+  //    并当场暴露一个真 bug：SETTINGS_ZH / SETTINGS_EN 没随卡片移植（已补）。
+
+  const s = await setup();
+  const host = s.host;
+
+  // ── ① ★ 卡片注册到正确的槽位 ─────────────────────────────
+  const card = host.registered.find((r) => r.opts && r.opts.name === "plugins.bundle.config");
+  ok(card !== undefined, "[56] ★ 卡片注册到 plugins.bundle.config 槽位");
+  /**
+   * ⚠️ key 必须**正好等于包名**。
+   *    官方页面按 key 派发这个 keyed 槽位，并把它投影成 `configured` 标志；
+   *    key 写错**不会报错、只是什么都不显示**（无日志、无异常）。
+   *    这是踩过的坑，必须钉住。
+   */
+  eq(card.opts.key, "dsh-codex-effort-slider",
+    "[56] ★ 槽位 key = 包名（写错会静默不显示）");
+  /**
+   * ⚠️ 还要钉住 **inject 用的槽位名**。
+   *
+   * 反向对照发现：把 `ctx.slots.inject("plugins.bundle.config", …)` 里的名字改成
+   * 别的，卡片仍会被注册进假 ctx（假件的 inject 只是直接 callback()），
+   * 于是上面的 find 照样能命中 —— 但真机上它会注册到一个**没人派发的槽位**，
+   * 卡片永远不显示。所以这里做**源码级断言**。
+   */
+  {
+    const { readFileSync } = await import("node:fs");
+    const src = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
+    ok(/ctx\.slots\.inject\("plugins\.bundle\.config"/.test(src),
+      "[56] ★★ 卡片 inject 的槽位名必须是 plugins.bundle.config");
+  }
+
+  // ── ② ★ 词条已注册，且键覆盖所有设置项 ────────────────────
+  ok(host.localeRegistrations.length > 0, "[56] ★ 通过 ctx.locale.register 注册了词条");
+  const reg = host.localeRegistrations[host.localeRegistrations.length - 1];
+  eq(reg.ns, "settings.codexEffortSlider", "[56] ★ 命名空间 = settings.codexEffortSlider");
+  ok(reg.dictionaries && reg.dictionaries.zh && reg.dictionaries.en,
+    "[56] ★ 中英两套词条都在");
+  const zhKeys = Object.keys(reg.dictionaries.zh).sort();
+  ok(zhKeys.length > 0, `[56] 中文词条 ${zhKeys.length} 条`);
+  /**
+   * ⚠️ 词条键是**语义名**（hideTitle / targetTitle / ticksShow …），
+   *    不是 schema 的 key（hideTicks / highlightTarget …）。
+   *    所以不能拿 key 去做子串匹配，只能按**已知映射**逐项核对：
+   *    每个设置项都必须有对应的标题键，否则界面显示键名。
+   */
+  const NEEDED = [
+    ["hideTicks", "hideTitle"],            // 刻度点显示
+    ["highlightTarget", "targetTitle"],     // 高亮目标刻度点
+    ["highlightReached", "reachedTitle"],   // 高亮已到达刻度点
+  ];
+  for (const [itemKey, dictKey] of NEEDED) {
+    ok(typeof reg.dictionaries.zh[dictKey] === "string" && reg.dictionaries.zh[dictKey].length > 0,
+      `[56] ★ 设置项 ${itemKey} 有标题词条（${dictKey}）`);
+    ok(typeof reg.dictionaries.en[dictKey] === "string" && reg.dictionaries.en[dictKey].length > 0,
+      `[56] ★ 设置项 ${itemKey} 有英文词条（${dictKey}）`);
+  }
+  // 刻度点三个选项的文案
+  for (const k of ["ticksShow", "ticksHideReached", "ticksHideAll"]) {
+    ok(typeof reg.dictionaries.zh[k] === "string" && reg.dictionaries.zh[k].length > 0,
+      `[56] ★ 刻度点选项词条 ${k} 存在`);
+  }
+  // 恢复默认按钮的文案也要有
+  ok(typeof reg.dictionaries.zh.restoreDefaults === "string" && reg.dictionaries.zh.restoreDefaults.length > 0,
+    "[56] ★ 有「恢复默认」的词条");
+  ok(reg.dictionaries.zh.restoreDefaults === "恢复默认",
+    `[56] 恢复默认文案 = 「${reg.dictionaries.zh.restoreDefaults}」`);
+  // 动画三档的文案在 schema 的 options.label 里（上游 schema 自带中文）
+  const motionItem = s.internals.SETTINGS_SCHEMA.find((it) => it.key === "motion");
+  eq(motionItem.options.map((o) => o.label).join("/"), "快速动画/简洁动画/完整动画",
+    "[56] ★ 动画三档的选项文案在 schema 里");
+
+  // ── ③ ★ 卡片组件能渲染出四个设置项 + 操作行 ────────────────
+  const I = s.internals;
+  /**
+   * ⚠️ 测试台的 react 桩只提供 `mount(Component, props, parent)`，
+   *    没有 `render`（那是我按 React 正式 API 想当然了）。
+   *    这里挂到一个临时容器上，挂完读它的 innerText。
+   */
+  /**
+   * ⚠️ 卡片组件的 props 是**官方渲染器**注入的，不是插件自己造：
+   *
+   *      inject() 返回 { hooks: { settings }, setSetting, restoreSettings }
+   *        → 渲染器把 hooks.settings 绑成 useSettings(selector) 选择器 hook
+   *        → 把 setSetting / restoreSettings 原样透传
+   *        → 再加上 t（按 locale 命名空间取词）
+   *
+   *    测试台没有那个渲染器，所以这里**手工模拟**它（契约照上面逐条对齐）。
+   *    这也正是本轮最有价值的发现之一：不模拟的话卡片根本跑不起来，
+   *    387 行代码等于从未被验证过。
+   */
+  const cardInject = card.opts.inject ? card.opts.inject() : {};
+  const cardDoc = createDocument();
+  const cardHost = cardDoc.createElement("div");
+  cardDoc.body.appendChild(cardHost);
+  const useSettingsStub = (selector) => {
+    const value = cardInject.hooks.settings.getSnapshot();
+    return typeof selector === "function" ? selector(value) : value;
+  };
+  const tStub = (key) => {
+    const d = reg.dictionaries.zh || {};
+    return d[key] !== undefined ? d[key] : key;
+  };
+  s.react.mount(card.Component, {
+    hooks: cardInject.hooks,
+    setSetting: cardInject.setSetting,
+    restoreSettings: cardInject.restoreSettings,
+    useSettings: useSettingsStub,
+    t: tStub,
+  }, cardHost);
+  await settle();
+  const allText = String(cardHost.textContent || "");
+  ok(allText.length > 0, "[56] ★ 卡片组件能渲染出内容");
+
+  // 四个设置项的标签（中文词条）
+  for (const label of ["动画效果", "刻度点显示", "高亮目标刻度点", "高亮已到达刻度点"]) {
+    ok(allText.indexOf(label) >= 0, `[56] ★ 卡片渲染出「${label}」`);
+  }
+  /**
+   * 动画三档的选项文案 —— ⚠️ 需要在**展开下拉框之后**才看得到。
+   *
+   * 卡片的每一项是一个下拉（Menu），选项只在 open=true 时渲染。
+   * 所以先点开「动画效果」那一行的触发按钮，再读文案。
+   */
+  {
+    /**
+     * ⚠️ 测试台的 `querySelectorAll` **只支持** `标签[attr="值"]` 形式，
+     *    不支持 `.class` 选择器（matches() 的正则里没有 .class 分支）。
+     *    所以这里用属性选择器定位下拉触发按钮 —— 它有 `aria-haspopup="menu"`。
+     */
+    const triggers = cardHost.querySelectorAll('button[aria-haspopup="menu"]');
+    let opened = false;
+    for (const btn of triggers) {
+      const label = String((btn.getAttribute && btn.getAttribute("aria-label")) || "");
+      const h = btn.handlers || {};
+      // 动画那一项的 aria-label 是 motionTitle 查出来的「动画效果」
+      if ((label.indexOf("动画") >= 0 || label.indexOf("Animation") >= 0) && typeof h.onClick === "function") {
+        h.onClick();
+        opened = true;
+        break;
+      }
+    }
+    // 兜底：动画是 CARD_GROUPS 第一项，按 label 没匹配上就点第一个
+    if (!opened && triggers.length > 0 && typeof (triggers[0].handlers || {}).onClick === "function") {
+      triggers[0].handlers.onClick();
+      opened = true;
+    }
+    ok(opened, `[56] 找到并点开了「动画效果」下拉框（共 ${triggers.length} 个下拉）`);
+    await settle();
+    /**
+     * ⚠️ 展开后**不能只读外层 textContent** —— 测试台的 FakeNode 文本聚合
+     *    对 Menu 桩嵌套的列表可能取不到（实测就是取不到）。
+     *    改为逐层收集所有节点的 textContent，确保能看到深层选项。
+     */
+    const collectText = (node, out) => {
+      if (node === null || node === undefined) return out;
+      const t = node.textContent;
+      if (t !== undefined && t !== null && String(t).length > 0) out.push(String(t));
+      const kids = node.children || [];
+      for (const c of kids) collectText(c, out);
+      return out;
+    };
+    const openedText = collectText(cardHost, []).join(" ");
+    // 调试：把展开后能拿到的文本打出来（后续稳定后删除）
+    for (const opt of ["快速动画", "简洁动画", "完整动画"]) {
+      ok(openedText.indexOf(opt) >= 0, `[56] ★ 动画选项「${opt}」在展开的下拉里`);
+    }
+  }
+  /**
+   * 操作行的「恢复默认」按钮。
+   *
+   * ⚠️ 不能只看文本存在 —— 反向对照发现：给那一行加 `style: { display: "none" }`
+   *    时文本仍在 DOM 里，断言照样绿。所以改为**按标签找按钮并检查它有 onClick**。
+   */
+  {
+    const buttons = cardHost.querySelectorAll("button");
+    const restoreBtn = buttons.find((b) => String(b.textContent || "").indexOf("恢复默认") >= 0);
+    ok(restoreBtn !== undefined, "[56] ★ 有「恢复默认」按钮（按 button 标签找到）");
+    ok(typeof (restoreBtn.handlers || {}).onClick === "function",
+      "[56] ★ 「恢复默认」按钮可点（有 onClick）");
+  }
+
+  // ── ④ ★ 词条真的被用于渲染（而不是显示键名）───────────────
+  ok(allText.indexOf("hideTicks") < 0, "[56] ★ 不显示键名 hideTicks（词条生效）");
+  ok(allText.indexOf("highlightTarget") < 0, "[56] ★ 不显示键名 highlightTarget（词条生效）");
+  ok(allText.indexOf("restoreDefaults") < 0, "[56] ★ 不显示键名 restoreDefaults（词条生效）");
+}
+
+section("57. ★ 卡片降级纪律：原语缺失时不崩、滑条照常工作");
+{
+  // 目标 ④ 要求 fail-open：取不到原语时跳过卡片，**绝不能把滑条拖下水**。
+  const cases = [
+    { omit: ["Menu"], label: "Menu" },
+    { omit: ["Button"], label: "Button" },
+    { omit: ["Switch"], label: "Switch" },
+    { omit: ["IconChevronDownOutlineRegular"], label: "下拉箭头图标" },
+  ];
+  for (const c of cases) {
+    const doc = createDocument();
+    const menu = createOfficialMenu(doc, {});
+    const bundle = loadBundle(BUNDLE, doc, { omitPrimitives: c.omit });
+    const host = createFakeHost({});
+    let threw = null;
+    try {
+      bundle.plugin.apply(host.ctx);
+    } catch (error) {
+      threw = error;
+    }
+    eq(threw, null, `[57] ★ 缺少 ${c.label} 时不抛错（fail-open）`);
+    // 卡片应当被跳过
+    const card = host.registered.find((r) => r.opts && r.opts.name === "plugins.bundle.config");
+    eq(card, undefined, `[57] ★ 缺少 ${c.label} 时跳过卡片`);
+    // **但滑条必须照常注册**
+    const slider = host.registered.find((r) => r.opts && r.opts.name === "conversation.input.right");
+    ok(slider !== undefined, `[57] ★ 缺少 ${c.label} 时滑条仍然注册（不受连累）`);
+    // 而且滑条能正常挂载渲染
+    bundle.react.mount(slider.Component, { sessionId: "session-abcdef" }, menu.composer);
+    await settle();
+    ok(bundle.react.find("track") !== null, `[57] ★ 缺少 ${c.label} 时滑条仍能渲染`);
+  }
 }
 
 console.log(`\n${failed === 0 ? "全部通过 ✅" : "有失败 ❌"} （${passed} 项通过，${failed} 项失败）`);

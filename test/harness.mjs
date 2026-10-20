@@ -637,6 +637,10 @@ export function createFakeHost(options = {}) {
 
   const registered = [];
   const subscriptions = [];
+  /** `ctx.effect(...)` 返回的 dispose 函数（测试不关心清理时机，只记录）。 */
+  const effects = [];
+  /** `ctx.locale.register(...)` 的调用记录（供断言"词条注册了哪些键"）。 */
+  const localeRegistrations = [];
   const ctx = {
     /** 监视宿主事件订阅：本插件应当**一次都不订阅**（这是"不注入消息"的结构性证据）。 */
     on: (name, ...rest) => {
@@ -661,6 +665,42 @@ export function createFakeHost(options = {}) {
         return { dispose() {} };
       },
     },
+    /**
+     * `ctx.effect(fn)` —— Cordis 的「随插件卸载自动清理」包装。
+     *
+     * 设置卡片用它包住 `ctx.locale.register(...)`：
+     *
+     *     ctx.effect(function () {
+     *       return ctx.locale.register(SETTINGS_NS, { zh, en });
+     *     });
+     *
+     * ⚠️ 测试台原先没有这个方法 → 卡片注册时直接抛
+     *    `TypeError: ctx.effect is not a function` → 整块卡片失效。
+     *    真宿主里它是 Cordis 提供的，离线必须补上。
+     *    语义等价：立即执行一次，把返回的 dispose 记下来（测试不关心清理时机）。
+     */
+    effect: (fn) => {
+      const dispose = fn();
+      effects.push(dispose);
+      return () => { if (typeof dispose === "function") dispose(); };
+    },
+    /**
+     * `ctx.locale` —— 词条注册。
+     *
+     * 卡片用 `ctx.locale.register(SETTINGS_NS, { zh: {...}, en: {...} })` 注册词典，
+     * 渲染时用 `t(key)` 取词。测试台记录注册结果，供断言"词条注册了哪些键"。
+     */
+    locale: {
+      register: (ns, dictionaries) => {
+        localeRegistrations.push({ ns, dictionaries });
+        return { dispose() {} };
+      },
+    },
+    /**
+     * `ctx.remote` —— 目录访问的远端通道。
+     * 滑条那条链路会查它是否可用（缺了会走"目录不可用"分支）。
+     */
+    remote: { session: { directory: () => null } },
   };
 
   return {
@@ -671,6 +711,8 @@ export function createFakeHost(options = {}) {
     loads,
     registered,
     subscriptions,
+    effects,
+    localeRegistrations,
     get directoryForCalls() { return directoryForCalls; },
   };
 }
@@ -816,10 +858,96 @@ export function loadBundle(bundlePath, document, options = {}) {
   run(window, document, console, setTimeout, clearTimeout, performanceStub, CustomEventStub);
   if (registration === null) throw new Error("bundle 没有调用 window.__ModuleLoader__.load()");
   const react = createReactStub();
+  /**
+   * 官方 UI 原语的桩件。
+   *
+   * 真宿主里这些来自 `@deepseek-ai/dsh-client-ui-primitives`（Module Loader 形态的插件
+   * 隐式拿到它）。**不提供的话产品会走"原语不可用就跳过设置卡片"的降级分支** ——
+   * 那样卡片的断言会全部失去意义（假通过），所以这些桩件是必需的。
+   */
+  const primitives = {
+    Menu(props) {
+      const children = [props.anchor ?? null];
+      if (props.open === true) {
+        const items = Array.isArray(props.items) ? props.items : [];
+        children.push(react.createElement("div", { className: "menu-stub__list", key: "list" },
+          items.map((item) => react.createElement("button", {
+            type: "button",
+            key: item.id,
+            className: "menu-stub__item",
+            onClick: () => props.onSelect(item.id),
+          }, item.label))));
+      }
+      return react.createElement("span", { className: "menu-stub" }, children);
+    },
+    Button(props) {
+      // ⚠️ 必须把 children 透传：丢掉它按钮就成了空标签，
+      //    "有「恢复默认」按钮"这类断言会永远失败（而且看不出原因）。
+      const { variant, size, icon, children, ...rest } = props ?? {};
+      return react.createElement("button", Object.assign({ type: "button" }, rest), children);
+    },
+    IconChevronDownOutlineRegular(props) {
+      return react.createElement("svg", props ?? {});
+    },
+    /**
+     * 瞬时反馈尾部的两个图标（成功勾 / 失败叉）。
+     *
+     * ⚠️ 这两个**必须提供**，否则产品里 `IconCheckOutlineRegular === null` 的降级分支
+     *    会把图标整个跳过 —— 于是"有没有渲染图标"的断言会永远看不到图标（假通过）。
+     *    名字按宿主 asar 里的真实导出名。
+     */
+    IconCheckOutlineRegular(props) {
+      return react.createElement("svg", Object.assign({ "data-icon": "check" }, props ?? {}));
+    },
+    IconCloseOutlineRegular(props) {
+      return react.createElement("svg", Object.assign({ "data-icon": "close" }, props ?? {}));
+    },
+    /**
+     * 官方 Switch 桩，签名与宿主交付一致：
+     *   `Switch({ checked, onChange, label, disabled })` → `<button role="switch" aria-checked>`
+     *   **`onChange` 收到的是新值**（真实现是 `onClick: () => onChange(!checked)`）。
+     */
+    Switch(props) {
+      const { checked, onChange, label, disabled, ...rest } = props ?? {};
+      return react.createElement("button", Object.assign({
+        type: "button",
+        role: "switch",
+        "aria-checked": checked === true,
+        "aria-label": label,
+        "data-switch": checked === true ? "1" : "0",
+        // 布尔属性按真 DOM 语义挂（renderElement 会写成 DOM 属性而非 attribute）。
+        disabled: disabled === true,
+        // ⚠️ 必须把 onChange 转成 onClick 挂上去：只解构不接的话，
+        //    测试里 `node.handlers.onClick` 不存在，点开关会直接抛错。
+        onClick: typeof onChange === "function" ? () => onChange(checked !== true) : undefined,
+      }, rest), null);
+    },
+  };
   const plugin = registration.factory((spec) => {
     if (spec === "react") return react;
     // 真宿主里 react-dom 是平台种子词；桩件只要 createPortal（组件唯一的用法）。
     if (spec === "react-dom") return { createPortal: react.createPortal };
+    /**
+     * 官方 UI 原语。
+     *
+     * ⚠️ 不提供的话，产品会走「原语不可用 → 跳过设置卡片」的降级分支，
+     *    于是**卡片代码在离线从未被执行** ——
+     *    日志里「跳过设置卡片」出现 68 次就是证据。
+     *    那会让所有卡片断言假通过（或根本无法写）。
+     *
+     * `options.omitPrimitives` 用于验证降级纪律：故意抽掉某个原语后，
+     * 产品应当跳过卡片而不是崩溃。
+     */
+    if (spec === "@deepseek-ai/dsh-client-ui-primitives") {
+      const omitted = Array.isArray(options.omitPrimitives) ? options.omitPrimitives : [];
+      if (omitted.length === 0) return primitives;
+      const pruned = {};
+      for (const key of Object.keys(primitives)) {
+        if (omitted.includes(key)) continue;
+        pruned[key] = primitives[key];
+      }
+      return pruned;
+    }
     throw new Error(`测试台没有为 require(${JSON.stringify(spec)}) 准备桩件`);
   });
   /** 触发所有 MutationObserver 桩（等价于"官方菜单刚出现"）。 */
