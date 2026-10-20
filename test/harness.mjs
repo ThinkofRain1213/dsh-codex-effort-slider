@@ -701,15 +701,48 @@ export function loadBundle(bundlePath, document, options = {}) {
   MutationObserverStub.prototype.disconnect = function disconnect() { this.targets.length = 0; };
   MutationObserverStub.prototype.trigger = function trigger() { this.callback([]); };
 
+  /**
+   * **真实的 window 事件表**。
+   *
+   * ⚠️ 这里原先是空实现（`addEventListener() {}` / `dispatchEvent() {}`），
+   *    导致「设置变更 → 广播 settings 事件 → 组件订阅回调 → 重渲染」
+   *    这条链路在离线测试里**完全断掉**：
+   *    测试里 `writeSettings(...)` 之后，刻度点/动画参数永远不更新，
+   *    于是所有"改设置应当改变渲染"的断言都只能绕成"直接读纯函数"。
+   *
+   *    真机上这条链路是通的（浏览器原生支持），离线测试必须能模拟它，
+   *    否则测出来的行为与真机不一致。
+   */
+  const windowListeners = new Map();
   const window = {
     __ModuleLoader__: {
       load(reg) { registration = reg; },
     },
     innerWidth: 1280,
     innerHeight: 800,
-    addEventListener() {},
-    removeEventListener() {},
-    dispatchEvent() {},
+    addEventListener(type, listener) {
+      const key = String(type);
+      if (!windowListeners.has(key)) windowListeners.set(key, []);
+      windowListeners.get(key).push(listener);
+    },
+    removeEventListener(type, listener) {
+      const key = String(type);
+      const list = windowListeners.get(key);
+      if (!list) return;
+      const i = list.indexOf(listener);
+      if (i >= 0) list.splice(i, 1);
+    },
+    dispatchEvent(event) {
+      const key = String(event && event.type);
+      const list = windowListeners.get(key);
+      if (list) {
+        // 复制一份再遍历：监听器里可能增删监听器
+        for (const listener of list.slice()) {
+          try { listener(event); } catch (error) { /* 单个监听器抛错不影响其它 */ }
+        }
+      }
+      return true;
+    },
     Event: function FakeEvent(type) { this.type = type; },
     MutationObserver: MutationObserverStub,
     setInterval: (fn, ms) => setInterval(fn, ms),
@@ -767,8 +800,20 @@ export function loadBundle(bundlePath, document, options = {}) {
   // 只给这个 bundle 传它真正依赖的宿主全局；其余走真实全局（Promise/Set/Math/Date…）。
   // performance 单独传**假时钟**：引擎的"指针速度/松手外推"都读它，必须可控。
   const performanceStub = { now: () => clockNow() };
-  const run = new Function("window", "document", "console", "setTimeout", "clearTimeout", "performance", code);
-  run(window, document, console, setTimeout, clearTimeout, performanceStub);
+  /**
+   * CustomEvent 桩：`writeSettings` 广播设置变更时用它。
+   *
+   * ⚠️ 必须传进沙箱 —— 插件代码里写的是
+   *      `typeof CustomEvent === "function"`
+   *    不满足就**静默跳过广播**，于是"改设置 → 重渲染"这条链路断掉。
+   *    真机上 CustomEvent 是浏览器原生的，离线必须补上才不会测出假行为。
+   */
+  function CustomEventStub(type) { this.type = type; }
+  const run = new Function(
+    "window", "document", "console", "setTimeout", "clearTimeout", "performance", "CustomEvent",
+    code,
+  );
+  run(window, document, console, setTimeout, clearTimeout, performanceStub, CustomEventStub);
   if (registration === null) throw new Error("bundle 没有调用 window.__ModuleLoader__.load()");
   const react = createReactStub();
   const plugin = registration.factory((spec) => {

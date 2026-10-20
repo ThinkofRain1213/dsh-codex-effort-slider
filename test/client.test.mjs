@@ -1205,11 +1205,19 @@ section("19. 两种动画模式：简洁 / 完整，且都不受系统「减少�
   ok(I.RELEASE_PROJECT_S === 0, "[19] 灵敏度 = 0（非零外推会把落点推到另一档 → 抽搐）");
 
   // ④ 系统「减少动态效果」完全不影响行为
+  //
+  // ⚠️ 测试写法说明：设置变更现在**真的会传播**到渲染（测试台的 window 事件表
+  //    这轮补上了真实的 addEventListener/dispatchEvent/CustomEvent）。
+  //    所以不能再用「两个实例对比」来验"系统设置无关"—— 因为 writeSettings
+  //    之后两者的 motion 档本来就不同了（同一时刻只有一个实例被改）。
+  //    正确的验法：**同一 motion 档下**，两个实例（系统偏好不同）渲染结果必须一致。
   for (const mode of ["full", "quick"]) {
     const a = await setup({ reducedMotion: true });
-    a.internals.writeSettings({ motion: mode });
     const b = await setup({ reducedMotion: false });
+    // 两个实例都设成同一个 motion 档，再比较
+    a.internals.writeSettings({ motion: mode });
     b.internals.writeSettings({ motion: mode });
+    await settle();
     eq(a.react.find("root").getAttribute("data-motion"), b.react.find("root").getAttribute("data-motion"),
       `[19] ${mode}：系统开关不改变 data-motion`);
     eq(String(a.react.find("track").getAttribute("title")), String(b.react.find("track").getAttribute("title")),
@@ -1223,6 +1231,9 @@ section("19. 两种动画模式：简洁 / 完整，且都不受系统「减少�
     };
     eq(await drive(a), await drive(b), `[19] ${mode}：逐帧位置与系统设置无关`);
   }
+  // 复位：后面的用例默认期望"完整动画"
+  I.writeSettings({ motion: "full" });
+  await settle();
 
   // ⑤ 刻度点：三项独立设置都能读写（默认值已在 ① 里验过）
   //
@@ -1730,6 +1741,276 @@ section("52. 三组动画参数都必须稳定（不许 bang-bang 自激振荡�
 }
 
 /* ══════════════════════════════════════════════════════════════════════ */
+
+section("53. 合并版新增：设置四项 schema / v3→v4 迁移 / 恢复默认");
+{
+  // 本节守「上游动画档 + 我们的刻度点三项」这个合并结果。
+  // ⚠️ 只测**设置层**（纯函数）；卡片的 DOM 渲染由 §54 覆盖。
+
+  const s = await setup();
+  const I = s.internals;
+
+  // ── ① schema 形状 ──────────────────────────────────────────
+  eq(I.SETTINGS_SCHEMA.length, 4, "[53] 设置共四项");
+  eq(I.SETTINGS_SCHEMA.map((x) => x.key).join(","),
+    "motion,hideTicks,highlightTarget,highlightReached", "[53] 四个键名与顺序");
+  eq(I.SETTINGS_VERSION, 4, "[53] 设置版本 = 4（v3→v4 拆分 reachedTicks）");
+
+  // 控件类型必须与 normalizeSettings/渲染分支对应
+  eq(I.SETTINGS_SCHEMA[0].kind, "radio", "[53] motion 是 radio（上游的动画档）");
+  eq(I.SETTINGS_SCHEMA[1].kind, "dropdown", "[53] hideTicks 是 dropdown");
+  eq(I.SETTINGS_SCHEMA[2].kind, "switch", "[53] highlightTarget 是 switch");
+  eq(I.SETTINGS_SCHEMA[3].kind, "switch", "[53] highlightReached 是 switch");
+
+  // ── ② 默认值 ──────────────────────────────────────────────
+  const def = I.schemaDefaults();
+  eq(def.motion, "full", "[53] 动画默认 = 完整动画（上游默认，保留）");
+  eq(def.hideTicks, "showAll", "[53] 刻度点默认 = 全部显示");
+  eq(def.highlightTarget, true, "[53] 高亮目标默认 = 开");
+  eq(def.highlightReached, false, "[53] 高亮已到达默认 = 关");
+
+  // ── ③ ★ v3 → v4 迁移（三种旧值都要正确翻译）──────────────
+  //
+  // ⚠️ 这是本节最重要的部分。旧版存的是 reachedTicks（radio 三态），
+  //    新 schema 没有这个键 —— 直接 normalizeSettings 会**静默丢掉**
+  //    → 老用户升级后设置被悄悄重置。所以必须走 migrateSettings。
+  {
+    // highlight（亮白显示）→ 全部显示 + 高亮已到达
+    const m1 = I.migrateSettings({ v: 3, motion: "fast", reachedTicks: "highlight" });
+    eq(m1.reachedTicks, undefined, "[53] ★ 迁移后旧键 reachedTicks 已删除");
+    eq(m1.hideTicks, "showAll", "[53] ★ reachedTicks=highlight → hideTicks=showAll");
+    eq(m1.highlightReached, true, "[53] ★ reachedTicks=highlight → highlightReached=true");
+    eq(m1.motion, "fast", "[53] ★ 迁移不影响用户已选的动画档");
+
+    // dim（与未到达同色）→ 全部显示 + 不高亮已到达
+    const m2 = I.migrateSettings({ v: 3, reachedTicks: "dim" });
+    eq(m2.hideTicks, "showAll", "[53] ★ reachedTicks=dim → hideTicks=showAll");
+    eq(m2.highlightReached, false, "[53] ★ reachedTicks=dim → highlightReached=false");
+
+    // hidden（隐藏）→ 隐藏已到达
+    const m3 = I.migrateSettings({ v: 3, reachedTicks: "hidden" });
+    eq(m3.hideTicks, "hideReached", "[53] ★ reachedTicks=hidden → hideTicks=hideReached");
+    eq(m3.highlightReached, false, "[53] ★ reachedTicks=hidden → highlightReached=false");
+
+    // 未知值 → 兜底为全部显示
+    const m4 = I.migrateSettings({ v: 3, reachedTicks: "什么鬼" });
+    eq(m4.hideTicks, "showAll", "[53] 未知旧值兜底 = showAll");
+
+    // 已是新格式时不覆盖用户的新值
+    const m5 = I.migrateSettings({ v: 4, reachedTicks: "hidden", hideTicks: "hideAll", highlightReached: true });
+    eq(m5.hideTicks, "hideAll", "[53] ★ 新键已存在时不被旧键覆盖");
+    eq(m5.highlightReached, true, "[53] ★ 新键已存在时不被旧键覆盖（开关）");
+
+    // 非对象输入不炸
+    eq(I.migrateSettings(null), null, "[53] 迁移对 null 安全");
+    eq(I.migrateSettings(undefined), undefined, "[53] 迁移对 undefined 安全");
+  }
+
+  // ── ④ ★ 旧配置的完整读取链：migrate → normalize ────────────
+  //
+  // ⚠️ 上游测试台没有 localStorage 桩（loadBundle 也不接受 settings 选项），
+  //    所以这里直接复现 readSettings 内部的**同一条处理链**：
+  //        normalizeSettings(migrateSettings(parsed))
+  //    并断言结果与 readSettings 的语义一致（含旧键清除与完整性）。
+  {
+    const s2 = await setup();
+    const I2 = s2.internals;
+    const parsedLegacy = { v: 3, motion: "quick", reachedTicks: "hidden" };
+    const read = I2.normalizeSettings(I2.migrateSettings(parsedLegacy));
+    eq(read.motion, "quick", "[53] ★ 读取链：旧配置的 motion 保留");
+    eq(read.hideTicks, "hideReached", "[53] ★ 读取链：旧 reachedTicks=hidden 迁成 hideReached");
+    eq(read.highlightTarget, true, "[53] ★ 读取链：缺失的新开关用默认值补齐");
+    eq(read.highlightReached, false, "[53] ★ 读取链：从 hidden 迁来的高亮已到达 = 关");
+    eq(read.reachedTicks, undefined, "[53] ★ 读取链：旧键不再出现在设置对象里");
+    const missing = I2.SETTINGS_SCHEMA.filter((it) => read[it.key] === undefined).map((it) => it.key);
+    eq(missing.join(","), "", "[53] ★ 读取链：规范化后四项无一缺失");
+  }
+  // ── ⑤ 恢复默认 = 四项全复位 ──────────────────────────────
+  {
+    const s2 = await setup();
+    const I2 = s2.internals;
+    // 先改成非默认
+    I2.writeSettings({ motion: "fast", hideTicks: "hideAll", highlightTarget: false, highlightReached: true });
+    const changed = I2.readSettings();
+    eq(changed.motion, "fast", "[53] 前置：动画已改成 fast");
+    eq(changed.hideTicks, "hideAll", "[53] 前置：刻度点已改成 hideAll");
+    // 恢复默认（卡片的「恢复默认」按钮走同一路径：writeSettings(schemaDefaults())）
+    I2.writeSettings(I2.schemaDefaults());
+    const restored = I2.readSettings();
+    eq(restored.motion, "full", "[53] ★ 恢复默认：动画回 full");
+    eq(restored.hideTicks, "showAll", "[53] ★ 恢复默认：刻度点回 showAll");
+    eq(restored.highlightTarget, true, "[53] ★ 恢复默认：高亮目标回 true");
+    eq(restored.highlightReached, false, "[53] ★ 恢复默认：高亮已到达回 false");
+  }
+
+  // ── ⑥ 动画三档都映射到各自的参数组（上游行为，必须保留）────
+  //
+  // ⚠️ 这是「动画选项保留」的核心断言：选项不生效就等于没保留。
+  {
+    const s3 = await setup();
+    const I3 = s3.internals;
+    I3.writeSettings({ motion: "full" });
+    ok(I3.motionParamsForMode() === I3.MOTION, "[53] ★ motion=full → MOTION");
+    I3.writeSettings({ motion: "quick" });
+    ok(I3.motionParamsForMode() === I3.MOTION_REDUCED, "[53] ★ motion=quick → MOTION_REDUCED");
+    I3.writeSettings({ motion: "fast" });
+    ok(I3.motionParamsForMode() === I3.MOTION_FAST, "[53] ★ motion=fast → MOTION_FAST");
+    // 三套参数必须**真的不同**（否则选项等于装饰）
+    ok(I3.MOTION !== I3.MOTION_REDUCED && I3.MOTION !== I3.MOTION_FAST && I3.MOTION_REDUCED !== I3.MOTION_FAST,
+      "[53] ★ 三套运动参数互不相同");
+    ok(I3.MOTION_FAST.K > I3.MOTION.K && I3.MOTION_REDUCED.K > I3.MOTION.K,
+      "[53] ★ 快/简两档的位置增益都大于完整档（真的更快）");
+    I3.writeSettings({ motion: "full" });
+  }
+}
+
+section("54. ★ 刻度点解耦：三属性 × 三种隐藏模式 × 两个高亮开关");
+{
+  // 本节守「data-tick / data-lit / data-hide 三个属性」的渲染语义。
+  // 上游原本是一个 data-on（把目标与已到达合并），解耦后才能分别控制。
+
+  const s = await setup();
+  const I = s.internals;
+  const react = s.react;
+  const W = 300;
+
+  const trackNode = () => {
+    const n = react.find("track");
+    if (n) n.rect = { left: 0, top: 0, right: W, bottom: 28, width: W, height: 28 };
+    return n;
+  };
+  const at = (pct) => 14 + pct * (W - 28);
+  async function settle2() {
+    for (let f = 0; f < 240; f += 1) {
+      const e = s.bundle.flushFrames(1, 16);
+      for (let k = 0; k < 6; k += 1) await Promise.resolve();
+      if (e === 0) break;
+    }
+    await settle();
+  }
+  /** 读当前所有刻度的三属性。 */
+  const ticks = () => react.findAll("tick").map((n) => ({
+    tick: n.getAttribute("data-tick"),
+    lit: n.getAttribute("data-lit"),
+    hide: n.getAttribute("data-hide"),
+  }));
+  const visibleCount = () => ticks().filter((t) => t.hide === "0").length;
+  const litCount = () => ticks().filter((t) => t.lit === "1").length;
+
+  // ── ① 属性齐备且互斥（每个刻度三个属性都有合法值）───────────
+  {
+    const t = ticks();
+    ok(t.length >= 4, `[54] 有 ${t.length} 个刻度点`);
+    ok(t.every((x) => ["target", "reached", "ahead"].includes(x.tick)),
+      "[54] ★ 每个刻度的 data-tick 都是 target/reached/ahead 之一");
+    ok(t.every((x) => x.lit === "0" || x.lit === "1"), "[54] ★ data-lit 只有 0/1");
+    ok(t.every((x) => x.hide === "0" || x.hide === "1"), "[54] ★ data-hide 只有 0/1");
+    eq(t.filter((x) => x.tick === "target").length, 1, "[54] ★ 有且只有一个「目标」刻度");
+    ok(I.CSS.indexOf("data-on") < 0, "[54] ★ CSS 里不再有 data-on（已彻底解耦）");
+  }
+
+  // ── ② ★ 隐藏模式 hideAll：全部隐藏且全部不亮 ────────────────
+  {
+    I.writeSettings({ hideTicks: "hideAll" });
+    await settle();
+    eq(visibleCount(), 0, "[54] ★ hideAll：所有刻度都 data-hide=1");
+    eq(litCount(), 0, "[54] ★ hideAll：被隐藏的刻度一律不亮（属性不说谎）");
+  }
+
+  // ── ③ ★ 隐藏模式 showAll：全部可见 ────────────────────────
+  {
+    I.writeSettings({ hideTicks: "showAll" });
+    await settle();
+    eq(visibleCount(), ticks().length, "[54] ★ showAll：所有刻度都 data-hide=0");
+  }
+
+  // ── ④ ★ 隐藏模式 hideReached：隐藏旋钮左侧的全部（含目标）──
+  {
+    // 先拖到最右（目标 = 最后一档，前面都是已到达）
+    I.writeSettings({ hideTicks: "hideReached" });
+    trackNode().fire("onPointerDown", { clientX: at(1.0), pointerId: 1 });
+    await settle2();
+    const t = ticks();
+    const target = t.find((x) => x.tick === "target");
+    ok(target !== undefined, "[54] hideReached：仍有目标刻度");
+    /**
+     * ⚠️ 语义说明（这条断言改过一次，原因值得记下来）：
+     *
+     *   判据是 `passed = pctFromIndex(t) <= shownPct`，拖到**最右端**时
+     *   shownPct = 1.0，而最后一格的目标刻度 pctFromIndex 也 = 1.0
+     *   → `1.0 <= 1.0` 为 true → 它被判为"已过"而被隐藏。
+     *
+     *   这是**设计如此**：目标刻度与旋钮圆心重合时，隐藏它等于"旋钮自己就是
+     *   那个标记"，左侧区域保持干净。原先我按"目标是最后一格就不该隐藏"写断言，
+     *   是**测试预期错了**，不是实现错了。
+     */
+    eq(target.hide, "1", "[54] ★ hideReached：最右端时目标刻度与旋钮重合 → 隐藏（左侧干净）");
+    // 已到达的（除目标外）在旋钮左侧 → 也应被隐藏
+    const reached = t.filter((x) => x.tick === "reached");
+    ok(reached.length > 0, `[54] 前置：有 ${reached.length} 个已到达刻度`);
+    ok(reached.every((x) => x.hide === "1"),
+      "[54] ★ hideReached：已到达的刻度全部隐藏");
+  }
+
+  // ── ⑤ ★ 两个高亮开关独立生效（这是解耦的核心目的）──────────
+  {
+    I.writeSettings({ hideTicks: "showAll", highlightTarget: true, highlightReached: false });
+    trackNode().fire("onPointerDown", { clientX: at(1.0), pointerId: 1 });
+    await settle2();
+    const a = ticks();
+    eq(a.find((x) => x.tick === "target").lit, "1", "[54] ★ 高亮目标=开 → 目标亮");
+    ok(a.filter((x) => x.tick === "reached").every((x) => x.lit === "0"),
+      "[54] ★ 高亮已到达=关 → 已到达都不亮");
+
+    // 反过来：只高亮已到达、不高亮目标
+    I.writeSettings({ highlightTarget: false, highlightReached: true });
+    await settle();
+    const b = ticks();
+    eq(b.find((x) => x.tick === "target").lit, "0", "[54] ★ 高亮目标=关 → 目标不亮");
+    ok(b.filter((x) => x.tick === "reached").every((x) => x.lit === "1"),
+      "[54] ★ 高亮已到达=开 → 已到达都亮");
+
+    // 两个都关 → 一个都不亮
+    I.writeSettings({ highlightTarget: false, highlightReached: false });
+    await settle();
+    eq(litCount(), 0, "[54] ★ 两个开关都关 → 没有刻度亮");
+
+    // 两个都开 → 全部亮
+    I.writeSettings({ highlightTarget: true, highlightReached: true });
+    await settle();
+    eq(litCount(), ticks().length, "[54] ★ 两个开关都开 → 全部刻度都亮");
+  }
+
+  // ── ⑥ 「未到达」的刻度永远不亮（与开关无关）────────────────
+  {
+    I.writeSettings({ hideTicks: "showAll", highlightTarget: true, highlightReached: true });
+    // 拖到最左（目标 = 第一档，后面全是未到达）
+    trackNode().fire("onPointerDown", { clientX: at(0), pointerId: 1 });
+    await settle2();
+    const ahead = ticks().filter((x) => x.tick === "ahead");
+    ok(ahead.length > 0, `[54] 前置：有 ${ahead.length} 个未到达刻度`);
+    ok(ahead.every((x) => x.lit === "0"),
+      "[54] ★ 未到达的刻度永远不亮（即使两个开关都开）");
+  }
+
+  // ── ⑦ ★ 按位置判定的语义：旋钮停在两档之间时，左侧的「目标」也算已过 ──
+  //
+  // 这是 down 与上游按 t<shownIndex 的关键区别，也是解耦时特意保留的语义。
+  {
+    I.writeSettings({ hideTicks: "hideReached", highlightTarget: true, highlightReached: false });
+    // 拖到 41%（4 档模型下 indexFromPct(0.41,4)=round(1.23)=1，最近档在下标 1）
+    // 但下标 0 的刻度物理位置在 0%，在旋钮左侧 → 应被算作"已过"而隐藏
+    trackNode().fire("onPointerDown", { clientX: at(0.41), pointerId: 1 });
+    await settle2();
+    const t = ticks();
+    // 下标 0 那个刻度（最左）在旋钮左侧 → hideReached 下必须隐藏
+    eq(t[0].hide, "1", "[54] ★ 按位置判定：旋钮左侧的刻度被隐藏（哪怕它是最近档）");
+  }
+
+  // ── ⑧ 复位，避免影响后续节 ────────────────────────────────
+  I.writeSettings(I.schemaDefaults());
+  await settle();
+}
 
 console.log(`\n${failed === 0 ? "全部通过 ✅" : "有失败 ❌"} （${passed} 项通过，${failed} 项失败）`);
 if (failed > 0) {
