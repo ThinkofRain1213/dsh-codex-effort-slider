@@ -1825,6 +1825,24 @@ section("53. 合并版新增：设置四项 schema / v3→v4 迁移 / 恢复默�
     const missing = I2.SETTINGS_SCHEMA.filter((it) => read[it.key] === undefined).map((it) => it.key);
     eq(missing.join(","), "", "[53] ★ 读取链：规范化后四项无一缺失");
   }
+  // ── ④b ★ readSettings 本身必须走 migrate（不能只测 normalize∘migrate）──
+  //
+  // ⚠️ 这条是**反向对照逼出来的**：§53④ 只验了
+  //        normalizeSettings(migrateSettings(parsed))
+  //    这个组合，但把 readSettings 内部改成
+  //        normalizeSettings(parsed)      ← 漏掉 migrate
+  //    时，④ 照样绿 —— 因为它绕开了 readSettings。真机上老用户升级会丢设置。
+  //
+  //    所以这里直接验 readSettings 的**实现细节**：它必须调用 migrateSettings。
+  {
+    const { readFileSync } = await import("node:fs");
+    const src = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
+    ok(/normalizeSettings\(migrateSettings\(parsed\)\)/.test(src),
+      "[53] ★★ readSettings 内部必须 normalizeSettings(migrateSettings(parsed)) —— 缺 migrate 会让老用户丢设置");
+    ok(/function readSettings\(\)[\s\S]{0,900}migrateSettings\(parsed\)/.test(src),
+      "[53] ★★ migrateSettings 确实在 readSettings 的函数体内");
+  }
+
   // ── ⑤ 恢复默认 = 四项全复位 ──────────────────────────────
   {
     const s2 = await setup();
@@ -2010,6 +2028,32 @@ section("54. ★ 刻度点解耦：三属性 × 三种隐藏模式 × 两个高�
   // ── ⑧ 复位，避免影响后续节 ────────────────────────────────
   I.writeSettings(I.schemaDefaults());
   await settle();
+}
+
+section("55. ★ manifest：locale 声明（词条能生效的硬前置）");
+{
+  // ⚠️ 这条是**反向对照逼出来的**：测试台不读 package.json，
+  //    所以删掉 exports["./locale/*.json"] 时全部测试照样绿 ——
+  //    但真机上插件列表会退回显示包名（DSH 用 Node ESM 解析元数据，
+  //    未列出的子路径抛 ERR_PACKAGE_PATH_NOT_EXPORTED，而 missingResource()
+  //    把它静默当作"没有"，于是回落包名）。
+  //
+  //    这是踩过的真坑（fork/main 的 728bd2e 就是修它），必须钉住。
+  const { readFileSync } = await import("node:fs");
+  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  ok(pkg.exports && pkg.exports["./locale/*.json"] === "./locale/*.json",
+    "[55] ★ package.json exports 必须含 \"./locale/*.json\"");
+  ok(Array.isArray(pkg.files) && pkg.files.includes("locale"),
+    "[55] ★ package.json files 必须含 \"locale\"（否则打包后 locale 目录不进包）");
+  // locale 文件必须真的存在且是合法 JSON（有 meta.title/description）
+  const en = JSON.parse(readFileSync(new URL("../locale/en.json", import.meta.url), "utf8"));
+  const zh = JSON.parse(readFileSync(new URL("../locale/zh.json", import.meta.url), "utf8"));
+  ok(en.meta && typeof en.meta.title === "string" && en.meta.title.length > 0,
+    "[55] locale/en.json 有 meta.title");
+  ok(zh.meta && typeof zh.meta.title === "string" && zh.meta.title.length > 0,
+    "[55] locale/zh.json 有 meta.title");
+  ok(zh.meta.title.indexOf("推理") >= 0,
+    `[55] 中文 title 是「${zh.meta.title}」（不是包名）`);
 }
 
 console.log(`\n${failed === 0 ? "全部通过 ✅" : "有失败 ❌"} （${passed} 项通过，${failed} 项失败）`);
