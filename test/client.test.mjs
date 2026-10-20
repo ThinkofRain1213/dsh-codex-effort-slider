@@ -876,7 +876,11 @@ section("16. Off 档保持官方灰 + 刻度点更小更淡");
   const tickCss = internals.CSS.slice(internals.CSS.indexOf(".ces-tick{"), internals.CSS.indexOf("}", internals.CSS.indexOf(".ces-tick{")));
   ok(tickCss.indexOf("width:3px;height:3px") > 0, "[16] 刻度点 5px → 3px（更小）");
   ok(tickCss.indexOf("26%,transparent") > 0, "[16] 未达到的刻度 38% → 26%（更淡）");
-  ok(internals.CSS.indexOf(".ces-tick[data-on='1']{background:rgba(255,255,255,.5)}") > 0, "[16] 已达刻度 92% → 50% 白（更淡，不再和星星抢眼）");
+  ok(internals.CSS.indexOf(".ces-tick[data-lit='1']{background:rgba(255,255,255,.5)}") > 0, "[16] 已到达刻度 92% → 50% 白（更淡，不再和星星抢眼）");
+  // ⚠️ 属性已解耦：上游用 data-on（目标+已到达合并），本版改成
+  //    data-tick（角色）/ data-lit（亮不亮）/ data-hide（在不在）三个独立属性。
+  ok(internals.CSS.indexOf(".ces-tick[data-hide='1']{display:none}") > 0, "[16] 隐藏规则由 data-hide 表达（判定在 JS 里算）");
+  ok(internals.CSS.indexOf("data-on='1'") < 0, "[16] CSS 里不再有 data-on（已解耦）");
   const tickNodes = off.react.findAll("tick");
   ok(tickNodes.length >= 4, `[16] 4 档就有 4 个刻度点（实测 ${tickNodes.length}）`);
 }
