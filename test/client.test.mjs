@@ -1172,13 +1172,24 @@ section("19. 两种动画模式：简洁 / 完整，且都不受系统「减少�
   const ctx = await setup();
   const I = ctx.internals;
 
-  // ① 设置只剩两项（灵敏度/力度已按要求删除）
-  eq(I.SETTINGS_SCHEMA.length, 2, "[19] 设置只有两项（动画 + 刻度点）");
-  eq(I.SETTINGS_SCHEMA.map((it) => it.key).join(","), "motion,reachedTicks", "[19] 键名正确，力度已删除");
+  // ① 设置四项：动画（上游）+ 刻度点三项（我们的解耦版）
+  //
+  // ⚠️ 合并说明：上游原来是 2 项（motion + reachedTicks radio 三态）。
+  //    本版把 `reachedTicks` 拆成「hideTicks 下拉 + 两个独立开关」——
+  //    因为三者合并进一个 data-on 属性时，目标刻度点和已到达刻度点无法分别寻址，
+  //    也就做不成两个独立开关（那正是要的功能）。所以现在是 4 项。
+  eq(I.SETTINGS_SCHEMA.length, 4, "[19] 设置共四项（动画 + 刻度点三项）");
+  eq(I.SETTINGS_SCHEMA.map((it) => it.key).join(","),
+    "motion,hideTicks,highlightTarget,highlightReached",
+    "[19] 键名正确：动画 + 刻度点解耦后的三项");
   eq(I.readSettings().motion, "full", "[19] 动画默认 = 完整动画");
   ok(I.SETTINGS_SCHEMA.every((it) => it.default !== undefined), "[19] 每项都显式声明 default");
   eq(I.SETTINGS_SCHEMA[0].options.map((o) => o.label).join("/"), "快速动画/简洁动画/完整动画", "[19] 选项文案与顺序（由上到下：快速 / 简洁 / 完整）");
   eq(I.SETTINGS_SCHEMA[0].group, "动画效果", "[19] 分组标题 = 动画效果（灰色那一行）");
+  // 刻度点三项的默认值
+  eq(I.readSettings().hideTicks, "showAll", "[19] 刻度点默认 = 全部显示");
+  eq(I.readSettings().highlightTarget, true, "[19] 高亮目标刻度点默认 = 开");
+  eq(I.readSettings().highlightReached, false, "[19] 高亮已到达刻度点默认 = 关");
 
   // ② 两种模式的参数组
   ok(I.motionParamsForMode() === I.MOTION, "[19] 完整动画 → MOTION（他的方案）");
@@ -1209,13 +1220,23 @@ section("19. 两种动画模式：简洁 / 完整，且都不受系统「减少�
     eq(await drive(a), await drive(b), `[19] ${mode}：逐帧位置与系统设置无关`);
   }
 
-  // ⑤ 刻度点（默认隐藏，可切换）
-  eq(I.readSettings().reachedTicks, "hidden", "[19] 刻度点默认 = 隐藏");
-  I.writeSettings({ reachedTicks: "highlight" });
-  eq(I.readSettings().reachedTicks, "highlight", "[19] 可切到亮白显示");
-  ok(/data-reached-ticks='hidden'/.test(I.CSS), "[19] CSS 含隐藏规则");
-  ok(/data-reached-ticks='dim'/.test(I.CSS), "[19] CSS 含同色规则");
-  I.writeSettings({ reachedTicks: "hidden" });
+  // ⑤ 刻度点：三项独立设置都能读写（默认值已在 ① 里验过）
+  //
+  // ⚠️ 这里只验"设置层"；刻度点的**渲染表现**（data-tick/data-lit/data-hide、
+  //    按位置判定的 passed）由 §刻度点解耦那一节覆盖 —— 它们解耦了，分开测更清楚。
+  I.writeSettings({ hideTicks: "hideAll" });
+  eq(I.readSettings().hideTicks, "hideAll", "[19] 可切到全都隐藏");
+  I.writeSettings({ hideTicks: "hideReached" });
+  eq(I.readSettings().hideTicks, "hideReached", "[19] 可切到隐藏已到达");
+  I.writeSettings({ highlightTarget: false });
+  eq(I.readSettings().highlightTarget, false, "[19] 高亮目标可关");
+  I.writeSettings({ highlightReached: true });
+  eq(I.readSettings().highlightReached, true, "[19] 高亮已到达可开");
+  // 非法值被规范化回默认（schema 驱动的校验）
+  I.writeSettings({ hideTicks: "不是合法值" });
+  eq(I.readSettings().hideTicks, "showAll", "[19] 非法值回退默认（normalizeSettings 生效）");
+  // 复位，避免影响后面的用例
+  I.writeSettings({ hideTicks: "showAll", highlightTarget: true, highlightReached: false });
 
   // ⑥ 未按键的 move 不得带动滑条
   {
