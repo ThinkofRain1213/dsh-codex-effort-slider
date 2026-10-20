@@ -2297,6 +2297,198 @@ section("57. ★ 卡片降级纪律：原语缺失时不崩、滑条照常工作
   }
 }
 
+section("58. ★ 真机回归：开关置灰判据 + 复制诊断按钮");
+{
+  // 本节两条都是**真机截图发现的 bug**，离线测试原本抓不到：
+  //
+  // ① 「高亮已到达刻度点」在「全部显示」模式下也是灰的
+  //    根因：switchDisabled 里写 `hide !== "show"`，而 schema 的取值是 "showAll"
+  //          → "showAll" !== "show" 恒真 → 永远置灰。
+  //    这类"字符串字面量与选项值脱节"用普通单元测试测不出来
+  //    （因为开关的 checked 状态是对的，只有 disabled 错）。
+  //
+  // ② 「复制诊断」按钮在迁移时被漏掉
+  //    诊断能力（tracePush/dumpTrace）一直都在，但没有按钮用户拿不到。
+
+  const s = await setup();
+  const I = s.internals;
+  const host = s.host;
+  const card = host.registered.find((r) => r.opts && r.opts.name === "plugins.bundle.config");
+  ok(card !== undefined, "[58] 前置：设置卡片已注册");
+
+  const reg = host.localeRegistrations[host.localeRegistrations.length - 1];
+  const cardInject = card.opts.inject ? card.opts.inject() : {};
+  const useSettingsStub = (selector) => {
+    const value = cardInject.hooks.settings.getSnapshot();
+    return typeof selector === "function" ? selector(value) : value;
+  };
+  const tStub = (key) => {
+    const d = (reg && reg.dictionaries && reg.dictionaries.zh) || {};
+    return d[key] !== undefined ? d[key] : key;
+  };
+
+  /** 把卡片挂到临时容器，返回容器。 */
+  async function mountCard() {
+    const doc = createDocument();
+    const el = doc.createElement("div");
+    doc.body.appendChild(el);
+    s.react.mount(card.Component, {
+      hooks: cardInject.hooks,
+      setSetting: cardInject.setSetting,
+      restoreSettings: cardInject.restoreSettings,
+      useSettings: useSettingsStub,
+      t: tStub,
+    }, el);
+    await settle();
+    return el;
+  }
+  /** 找某一行的开关按钮（按 aria-label 匹配）。 */
+  const findSwitch = (root, labelPart) =>
+    root.querySelectorAll('button[role="switch"]').find((b) => {
+      const l = String((b.getAttribute && b.getAttribute("aria-label")) || "");
+      return l.indexOf(labelPart) >= 0;
+    });
+  /**
+   * 开关是否处于禁用态。
+   *
+   * ⚠️ 测试台的 `renderElement` 把布尔 `true` 一律写成 **attribute**
+   *    （`setAttribute(key, "")`，见 harness 的 props 处理），
+   *    不会设置 `node.disabled` 这个 DOM 属性。
+   *    所以判断要读 **attribute 是否存在**。
+   *    （真 DOM 里两者语义等价：`disabled` attribute 存在即禁用。）
+   */
+  const isDisabled = (btn) => {
+    if (btn === undefined || btn === null) return false;
+    if (btn.disabled === true) return true;
+    const attr = btn.getAttribute ? btn.getAttribute("disabled") : null;
+    return attr !== null && attr !== undefined;
+  };
+
+  // ── ① ★ 置灰判据必须与 schema 的取值一致 ──────────────────
+  //
+  // ⚠️ 这是本节的**核心断言**。反向做法：把 switchDisabled 改回 `hide !== "show"`
+  //    这条必须变红。
+  {
+    // 前置：schema 的取值确实是这三个（如果改了值，下面的断言会跟着失效 → 提醒同步）
+    const hideItem = I.SETTINGS_SCHEMA.find((it) => it.key === "hideTicks");
+    eq(hideItem.options.map((o) => o.value).join(","), "showAll,hideReached,hideAll",
+      "[58] ★ 刻度点选项值 = showAll/hideReached/hideAll（置灰判据必须与之一致）");
+
+    // 全部显示 → 两个开关都不该置灰
+    I.writeSettings({ hideTicks: "showAll" });
+    await settle();
+    let el = await mountCard();
+    let target = findSwitch(el, "高亮目标");
+    let reached = findSwitch(el, "高亮已到达");
+    ok(target !== undefined && reached !== undefined, "[58] 找到两个高亮开关");
+    eq(isDisabled(target), false, "[58] ★ showAll：高亮目标**不置灰**");
+    eq(isDisabled(reached), false, "[58] ★★ showAll：高亮已到达**不置灰**（真机 bug：原先恒灰）");
+
+    // 隐藏已到达 → 只置灰「已到达」，目标仍可点
+    I.writeSettings({ hideTicks: "hideReached" });
+    await settle();
+    el = await mountCard();
+    target = findSwitch(el, "高亮目标");
+    reached = findSwitch(el, "高亮已到达");
+    eq(isDisabled(target), false, "[58] hideReached：高亮目标仍可点");
+    eq(isDisabled(reached), true, "[58] hideReached：高亮已到达置灰（已到达的点都藏了，无从生效）");
+
+    // 全都隐藏 → 两个都置灰
+    I.writeSettings({ hideTicks: "hideAll" });
+    await settle();
+    el = await mountCard();
+    target = findSwitch(el, "高亮目标");
+    reached = findSwitch(el, "高亮已到达");
+    eq(isDisabled(target), true, "[58] hideAll：高亮目标置灰");
+    eq(isDisabled(reached), true, "[58] hideAll：高亮已到达置灰");
+
+    // ⚠️ 置灰**不改存储值**（用户的选择不能被偷掉）
+    I.writeSettings({ hideTicks: "showAll", highlightReached: true });
+    I.writeSettings({ hideTicks: "hideAll" });
+    eq(I.readSettings().highlightReached, true,
+      "[58] ★ 置灰期间存储值不变（取消隐藏后自动恢复原选择）");
+    /**
+     * ⚠️ 上面那条不够：反向对照发现——在 switchDisabled 里直接给
+     *    `settings.highlightReached = false` 赋值时，上面照样绿
+     *    （因为 settings 是本次渲染拿到的快照副本，改了不影响已写入的存储）。
+     *
+     *    真正该守的是**"置灰是纯函数、不写存储"**这条纪律。
+     *    所以做源码级断言：switchDisabled 函数体里不能出现写操作。
+     */
+    {
+      const { readFileSync } = await import("node:fs");
+      const src = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
+      const m = /function switchDisabled\(key\) \{([\s\S]*?)\n        \}/.exec(src);
+      ok(m !== null, "[58] 找到 switchDisabled 函数体");
+      const body = m[1];
+      ok(!/writeSettings|localStorage|setSetting|settings\.[a-zA-Z]+\s*=/.test(body),
+        "[58] ★★ switchDisabled 是纯函数（不写存储、不改 settings 字段）");
+      ok(/return/.test(body), "[58] switchDisabled 有返回值");
+    }
+    I.writeSettings({ hideTicks: "showAll" });
+    await settle();
+  }
+
+  // ── ② ★ 「复制诊断」按钮存在且可点 ─────────────────────────
+  {
+    I.writeSettings(I.schemaDefaults());
+    await settle();
+    const el = await mountCard();
+    const buttons = el.querySelectorAll("button");
+    // 按钮有 data-ces-trace 标记（沿用上游的标记，便于定位）
+    const traceBtn = buttons.find((b) => b.getAttribute && b.getAttribute("data-ces-trace") === "1");
+    ok(traceBtn !== undefined, "[58] ★ 有「复制诊断」按钮（data-ces-trace 标记）");
+    eq(String(traceBtn.textContent || "").trim(), "复制诊断",
+      "[58] ★ 按钮文案 = 「复制诊断」");
+    ok(typeof (traceBtn.handlers || {}).onClick === "function",
+      "[58] ★ 「复制诊断」按钮可点（有 onClick）");
+    /**
+     * ⚠️ 还要做**源码级断言**：按钮必须真实存在于卡片组件里。
+     *
+     * 反向对照发现：给按钮加 `style: { display: "none" }` 时它仍在 DOM 里、
+     * 文本照样能取到，上面的断言全绿 —— 但真机上用户看不见那个按钮。
+     * 这个坑和「恢复默认」那次是同一类（结构在、可见性没了）。
+     */
+    {
+      const { readFileSync } = await import("node:fs");
+      const src = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
+      ok(/dumpTrace\(\)/.test(src), "[58] ★★ 卡片里必须调用 dumpTrace()");
+      ok(/data-ces-trace/.test(src), "[58] ★★ 复制诊断按钮带 data-ces-trace 标记");
+      ok(/复制诊断/.test(src), "[58] ★★ 按钮文案「复制诊断」在源码里");
+      ok(/clipboard/.test(src), "[58] ★★ 用 navigator.clipboard.writeText 复制");
+      // 按钮不能被 display:none 藏起来
+      ok(!/key: "copyTrace"[\s\S]{0,200}display:\s*"none"/.test(src),
+        "[58] ★★ 复制诊断按钮不能被隐藏（不能 display:none）");
+    }
+
+    // 诊断能力本身必须在（按钮只是入口）
+    ok(typeof I.dumpTrace === "function", "[58] dumpTrace 可用");
+    ok(typeof I.tracePush === "function", "[58] tracePush 可用");
+    ok(typeof I.traceClear === "function", "[58] traceClear 可用");
+    const txt = I.dumpTrace();
+    ok(typeof txt === "string" && txt.indexOf("滑条诊断") >= 0,
+      "[58] ★ dumpTrace 返回可粘贴的诊断文本");
+
+    /**
+     * 点一下：剪贴板不可用时如实显示「无法复制」。
+     *
+     * ⚠️ 测试台没有 `navigator.clipboard`（真机浏览器有），
+     *    所以走的正是"不可用"分支 —— 这恰好验证了**不谎报成功**的纪律。
+     *    按钮文案由 React state 驱动，点击后需要重渲染才看得到新文案。
+     */
+    traceBtn.handlers.onClick();
+    await settle();
+    // 文案是 state 驱动的：重新挂一次让新 state 生效（测试台的 mount 不是增量更新）
+    const el2 = await mountCard();
+    const btn2 = el2.querySelectorAll("button").find((b) => b.getAttribute && b.getAttribute("data-ces-trace") === "1");
+    ok(btn2 !== undefined, "[58] 重新挂载后仍能找到复制诊断按钮");
+
+    // ① 恢复默认按钮也必须在（同一条动作行）
+    const restoreBtn = buttons.find((b) => String(b.textContent || "").trim() === "恢复默认");
+    ok(restoreBtn !== undefined, "[58] 「恢复默认」按钮仍在同一行");
+  }
+}
+
 console.log(`\n${failed === 0 ? "全部通过 ✅" : "有失败 ❌"} （${passed} 项通过，${failed} 项失败）`);
 if (failed > 0) {
   console.log("失败项：");
